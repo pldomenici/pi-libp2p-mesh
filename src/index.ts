@@ -445,9 +445,11 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const { total: before, connected } = listPeers(store);
+      const before = store.peers.size;
       const removed = pruneAllDisconnected(store);
-      const { total: after } = listPeers(store);
+      const after = store.peers.size;
+      // After pruning all disconnected, remaining peers are connected
+      const connected = after;
 
       ctx.ui.notify(
         removed === 0

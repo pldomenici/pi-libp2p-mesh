@@ -68,10 +68,13 @@ const STALE_PEER_MS = 60 * 1000;
  * Remove stale/disconnected peers using two strategies:
  * 1. Agent-name dedup — when two entries share the same agentName, keep only the
  *    connected one (the disconnected entry is from a previous session that restarted).
- * 2. Time-based — remove peers disconnected for more than STALE_PEER_MS (30s).
+ * 2. Time-based — remove peers disconnected for more than STALE_PEER_MS (60s).
+ *
+ * Returns the number of removed entries.
  */
-export function pruneStalePeers(store: MeshStore): void {
+export function pruneStalePeers(store: MeshStore): number {
   const now = Date.now();
+  let removed = 0;
 
   // Strategy 1: agent-name dedup — same name, keep connected, remove disconnected
   const byName = new Map<string, MeshPeer[]>();
@@ -90,6 +93,7 @@ export function pruneStalePeers(store: MeshStore): void {
         for (const entry of entries) {
           if (entry.status === "disconnected") {
             store.peers.delete(entry.id);
+            removed++;
           }
         }
       }
@@ -102,9 +106,12 @@ export function pruneStalePeers(store: MeshStore): void {
       const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
       if (now - lastSeen > STALE_PEER_MS) {
         store.peers.delete(id);
+        removed++;
       }
     }
   }
+
+  return removed;
 }
 
 /**
@@ -420,10 +427,10 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     parameters: Type.Object({}),
 
     async execute() {
-      const { peers, connected, total } = listPeers(store);
-      const before = total;
+      const before = store.peers.size;
       const removed = pruneAllDisconnected(store);
-      const { total: after } = listPeers(store);
+      const after = store.peers.size;
+      const { connected } = listPeers(store);
 
       const text =
         removed === 0
