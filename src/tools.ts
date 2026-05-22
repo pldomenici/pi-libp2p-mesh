@@ -228,22 +228,43 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
       });
 
       try {
-        const response = await meshProtocols.sendMessage(params.peerId, {
-          protocol: "/pi-agent/0.1.0",
-          requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-          fromAgent: store.agentName,
-          message: params.message,
-          autoReply: params.autoReply,
-        });
+        const MAX_ATTEMPTS = 2;
+        const RETRY_DELAY_MS = 500;
+        let response: import("./types").AgentResponse;
+
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          try {
+            response = await meshProtocols.sendMessage(params.peerId, {
+              protocol: "/pi-agent/0.1.0",
+              requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+              fromAgent: store.agentName,
+              message: params.message,
+              autoReply: params.autoReply,
+            });
+            break; // success — exit retry loop
+          } catch (dialErr: any) {
+            if (attempt === MAX_ATTEMPTS) throw dialErr; // last attempt — rethrow
+            // Transient failure — wait and retry
+            if (onUpdate) {
+              onUpdate({
+                content: [{ type: "text", text: `Retry ${attempt}/${MAX_ATTEMPTS} after dial failure…` }],
+              });
+            }
+            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          }
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const finalResponse = response!;
 
         onUpdate?.({
-          content: [{ type: "text", text: `Response from ${response.fromAgent}:` }],
+          content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
         });
 
         const result: MeshSendResult = {
           peerId: params.peerId,
-          agentName: response.fromAgent,
-          response,
+          agentName: finalResponse.fromAgent,
+          response: finalResponse,
         };
 
         const peer = store.peers.get(params.peerId);
@@ -251,8 +272,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           content: [
             {
               type: "text",
-              text: `**Response from ${response.fromAgent}** (${params.peerId}):\n\n${response.message}` +
-                (response.error ? "\n\n⚠️ Peer reported an error." : ""),
+              text: `**Response from ${finalResponse.fromAgent}** (${params.peerId}):\n\n${finalResponse.message}` +
+                (finalResponse.error ? "\n\n⚠️ Peer reported an error." : ""),
             },
           ],
           details: result,

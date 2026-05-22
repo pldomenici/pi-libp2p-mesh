@@ -111,13 +111,18 @@ export class MeshNode {
     }
 
     // Assemble libp2p options
-    const tcpPort = mergedConfig.listenPorts?.tcp ?? 0;
-    const wsPort = mergedConfig.listenPorts?.ws ?? 0;
+    // Use a local type alias instead of `any` for type-safety
+    type Libp2pOptions = Parameters<typeof createLibp2p>[0];
 
-    const libp2pConfig: any = {
+    // Deep-merge listenPorts so that passing e.g. { listenPorts: { ws: 9000 } }
+    // retains the default tcp: 0 instead of wiping it out.
+    const listenTcp = config.listenPorts?.tcp ?? DEFAULT_CONFIG.listenPorts?.tcp ?? 0;
+    const listenWs = config.listenPorts?.ws ?? DEFAULT_CONFIG.listenPorts?.ws ?? 0;
+
+    const libp2pConfig: Libp2pOptions = {
       privateKey,
       addresses: {
-        listen: [`/ip4/0.0.0.0/tcp/${tcpPort}`, `/ip4/0.0.0.0/tcp/${wsPort}/ws`],
+        listen: [`/ip4/0.0.0.0/tcp/${listenTcp}`, `/ip4/0.0.0.0/tcp/${listenWs}/ws`],
         ...(mergedConfig.announceAddresses?.length
           ? { announce: mergedConfig.announceAddresses }
           : {}),

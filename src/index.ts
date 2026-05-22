@@ -25,7 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types";
 import { MeshNode } from "./node";
 import { MeshProtocols } from "./protocols";
-import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, recordBroadcast, type MeshStore } from "./tools";
+import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -34,6 +34,7 @@ import os from "node:os";
 
 let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
+let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
 const store: MeshStore = {
   peers: new Map(),
@@ -318,6 +319,15 @@ export default async function (pi: ExtensionAPI) {
 
       notify(pi, `Mesh node started as "${config.agentName}" (${meshNode.peerId})`);
 
+      // Background stale-peer pruning — runs every 30s to keep the peer
+      // table clean without explicit LLM-triggered prune commands.
+      pruneInterval = setInterval(() => {
+        const removed = pruneStalePeers(store);
+        if (removed > 0) {
+          notify(pi, `Background prune: removed ${removed} stale peer(s)`);
+        }
+      }, 30_000);
+
       ctx.ui.notify(
         `libp2p mesh online — ${meshNode.peerId}`,
         "info",
@@ -329,6 +339,11 @@ export default async function (pi: ExtensionAPI) {
 
   // 2. Session lifecycle: stop node
   pi.on("session_shutdown", async () => {
+    // Stop background pruning
+    if (pruneInterval) {
+      clearInterval(pruneInterval);
+      pruneInterval = null;
+    }
     if (meshProtocols) {
       await meshProtocols.stop();
     }

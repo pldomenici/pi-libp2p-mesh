@@ -32,8 +32,6 @@ export interface MeshPeer {
   discoveredAt: number;
   /** When this peer last disconnected (epoch ms, 0 if still connected) */
   disconnectedAt?: number;
-  /** Latency in ms (last measured, if available) */
-  latencyMs?: number;
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
