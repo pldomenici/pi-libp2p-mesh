@@ -95,9 +95,20 @@ export class MeshNode {
   static async create(config: MeshConfig): Promise<MeshNode> {
     const mergedConfig = { ...DEFAULT_CONFIG, ...config };
 
-    // Generate keypair and PeerId
-    const privateKey = await generateKeyPair("Ed25519");
-    const peerId = peerIdFromPrivateKey(privateKey);
+    // M1: Accept a pre-existing private key for stable identity across restarts.
+    // If provided, derive the PeerId directly; otherwise generate a fresh keypair.
+    let privateKey: Uint8Array;
+    let peerId: import("@libp2p/interface").PeerId;
+
+    if (mergedConfig.privateKey) {
+      // Reuse caller-supplied key (e.g. from persistent storage)
+      privateKey = mergedConfig.privateKey;
+      peerId = peerIdFromPrivateKey(privateKey);
+    } else {
+      // Generate a new Ed25519 keypair (expensive — avoid on every restart)
+      privateKey = await generateKeyPair("Ed25519");
+      peerId = peerIdFromPrivateKey(privateKey);
+    }
 
     // Assemble libp2p options
     const tcpPort = mergedConfig.listenPorts?.tcp ?? 0;

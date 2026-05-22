@@ -405,7 +405,28 @@ export class MeshProtocols {
       // Notify the registered callback (for logging/side effects)
       this._onMessage?.(peerIdStr, request);
     } catch (err) {
+      // M2: Write an error response so the sender fails fast (<100ms)
+      // instead of waiting for its full 30s timeout.
       console.error('[mesh-protocols] error handling incoming message:', err);
+
+      const errorResponse: AgentResponse = {
+        requestId: "unknown",
+        fromAgent: this.config.agentName,
+        fromPeerId: this.libp2p.peerId.toString(),
+        timestamp: Date.now(),
+        message: `Error processing request: ${err instanceof Error ? err.message : "unknown error"}`,
+        error: true,
+      };
+
+      try {
+        await stream.sink(
+          (async function* () {
+            yield encoder.encode(JSON.stringify(errorResponse));
+          })(),
+        );
+      } catch {
+        // Best-effort — stream may already be broken
+      }
     } finally {
       try {
         await stream.close();

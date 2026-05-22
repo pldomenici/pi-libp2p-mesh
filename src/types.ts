@@ -101,6 +101,12 @@ export interface MeshConfig {
   gossipTopic?: string;
   /** Announce addresses (e.g., public IP for NAT traversal) */
   announceAddresses?: string[];
+  /**
+   * Optional pre-existing Ed25519 private key (raw bytes).
+   * When provided, the PeerId is derived from this key instead of generating
+   * a new one — giving the agent a stable identity across restarts.
+   */
+  privateKey?: Uint8Array;
 }
 
 /** Default configuration */

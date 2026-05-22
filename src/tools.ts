@@ -35,6 +35,20 @@ export interface MeshStore {
   autoReplyAll: boolean;
 }
 
+/** M3: Maximum number of broadcast entries to retain before evicting oldest. */
+export const MAX_BROADCAST_HISTORY = 200;
+
+/**
+ * Push a broadcast onto the store's history, evicting the oldest entry if
+ * the cap is exceeded (prevents unbounded memory growth).
+ */
+export function recordBroadcast(store: MeshStore, msg: BroadcastMessage): void {
+  store.broadcastHistory.push(msg);
+  while (store.broadcastHistory.length > MAX_BROADCAST_HISTORY) {
+    store.broadcastHistory.shift();
+  }
+}
+
 /** Module-level reference — set by index.ts after session_start. */
 let meshProtocols: MeshProtocols | null = null;
 
@@ -299,8 +313,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           type: params.type,
         });
 
-        // Record in history
-        store.broadcastHistory.push({
+        // Record in history (capped at MAX_BROADCAST_HISTORY)
+        recordBroadcast(store, {
           fromAgent: store.agentName,
           fromPeerId: "self",
           timestamp: Date.now(),

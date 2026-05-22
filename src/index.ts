@@ -25,7 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types";
 import { MeshNode } from "./node";
 import { MeshProtocols } from "./protocols";
-import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, type MeshStore } from "./tools";
+import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, recordBroadcast, type MeshStore } from "./tools";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       break;
 
     case "broadcast":
-      store.broadcastHistory.push(ev.message);
+      recordBroadcast(store, ev.message);
       notify(pi, `Broadcast from ${ev.message.fromAgent}: ${ev.message.message.slice(0, 120)}`);
       break;
 
