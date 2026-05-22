@@ -186,7 +186,86 @@ export default async function (pi: ExtensionAPI) {
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
       };
 
-      // Incoming LLM-forward requests (autoReply !== true) — inject into pi's LLM
+      // ── LLM Request Queue (FIFO) ────────────────────────────────────────
+      // Fixes H4: concurrent onRequest calls no longer race on turn_end.
+      // Each incoming request is enqueued; the queue drains one at a time,
+      // waiting for each turn_end before sending the next message to the LLM.
+
+      const REQUEST_TIMEOUT_MS = 60_000;
+
+      type PendingRequest = {
+        peerId: string;
+        request: import("./types").AgentRequest;
+        resolve: (text: string) => void;
+        timer: ReturnType<typeof setTimeout>;
+      };
+
+      const requestQueue: PendingRequest[] = [];
+      let queueBusy = false;
+      let turnEndCleanup: (() => void) | null = null;
+
+      /** Extract assistant text from a turn_end event. */
+      function extractResponseText(msg: any): string {
+        if (!msg || msg.role !== "assistant") return "[no assistant response]";
+        if (typeof msg.content === "string") return msg.content || "[empty response]";
+        if (Array.isArray(msg.content)) {
+          return msg.content
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("\n") || "[empty response]";
+        }
+        return "[non-text response]";
+      }
+
+      /** Dequeue and process the oldest pending request after a turn_end fires. */
+      function advanceQueue() {
+        // Remove the old listener — one-shot per turn
+        if (turnEndCleanup) {
+          turnEndCleanup();
+          turnEndCleanup = null;
+        }
+
+        if (requestQueue.length === 0) {
+          queueBusy = false;
+          return;
+        }
+
+        // Peek ahead — if the next request has already timed out, skip and advance
+        while (requestQueue.length > 0) {
+          const next = requestQueue[0];
+          // Not yet timed out? Process it.
+          if (next.timer !== undefined) break;
+          // Already settled (timed out) — remove and try next
+          requestQueue.shift();
+        }
+
+        if (requestQueue.length === 0) {
+          queueBusy = false;
+          return;
+        }
+
+        const entry = requestQueue.shift()!;
+
+        // Register one-shot turn_end listener for this request
+        function onTurnEnd(event: any) {
+          clearTimeout(entry.timer);
+          entry.timer = undefined as any;
+          entry.resolve(extractResponseText(event.message));
+          // Advance the queue for the next request
+          advanceQueue();
+        }
+
+        pi.on("turn_end", onTurnEnd);
+        turnEndCleanup = () => pi.off("turn_end", onTurnEnd);
+
+        // Inject this request's message into the LLM
+        pi.sendUserMessage(
+          `[Mesh message from ${entry.request.fromAgent}]\n\n${entry.request.message}`,
+          { deliverAs: "steer" },
+        );
+      }
+
+      // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
       meshProtocols.onRequest = (peerId, request) => {
         // If global auto-reply-all is on, echo without LLM
         if (store.autoReplyAll) {
@@ -198,41 +277,22 @@ export default async function (pi: ExtensionAPI) {
         return new Promise<string>((resolve) => {
           let settled = false;
 
-          const timeout = setTimeout(() => {
+          const timer = setTimeout(() => {
             if (settled) return;
             settled = true;
             resolve(
-              `[timeout] Agent did not respond within 60s to: "${request.message}"`,
+              `[timeout] Agent did not respond within ${REQUEST_TIMEOUT_MS / 1000}s to: "${request.message}"`,
             );
-          }, 60_000);
+          }, REQUEST_TIMEOUT_MS);
 
-          pi.on("turn_end", (event) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeout);
+          const entry: PendingRequest = { peerId, request, resolve, timer };
+          requestQueue.push(entry);
 
-            const msg = event.message;
-            if (msg && msg.role === "assistant") {
-              const text =
-                typeof msg.content === "string"
-                  ? msg.content
-                  : Array.isArray(msg.content)
-                    ? msg.content
-                        .filter((c: any) => c.type === "text")
-                        .map((c: any) => c.text)
-                        .join("\n")
-                    : "[non-text response]";
-              resolve(text || "[empty response]");
-            } else {
-              resolve("[no assistant response]");
-            }
-          });
-
-          // Inject into pi's processing queue
-          pi.sendUserMessage(
-            `[Mesh message from ${request.fromAgent}]\n\n${request.message}`,
-            { deliverAs: "steer" },
-          );
+          // If queue is idle, kick it off
+          if (!queueBusy) {
+            queueBusy = true;
+            advanceQueue();
+          }
         });
       };
 
