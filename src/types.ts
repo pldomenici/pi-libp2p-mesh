@@ -51,6 +51,8 @@ export interface AgentRequest {
   message: string;
   /** If true (default), auto-reply without involving the LLM. If false, forward to the LLM. */
   autoReply?: boolean;
+  /** Optional per-request timeout override (ms). Default: 60_000. */
+  timeoutMs?: number;
 }
 
 export interface AgentResponse {

@@ -227,9 +227,10 @@ export class MeshProtocols {
       autoReply: request.autoReply,
     };
 
-    // Create an AbortController for the 30-second timeout
+    // Create an AbortController for the timeout (default 60s; per-request override)
+    const timeoutMs = request.timeoutMs ?? 60_000;
     const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 30_000);
+    const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
 
     let stream: Stream | null = null;
     try {

@@ -168,6 +168,7 @@ async function runTests(ctx) {
       requestId: uuidv4(),
       fromAgent: AGENT_NAME,
       message: SMALL_PAYLOAD,
+      autoReply: true,
     });
     if (!resp || !resp.message) throw new Error('Empty response');
     if (resp.error) throw new Error(`Peer reported error: ${resp.message}`);
@@ -180,6 +181,7 @@ async function runTests(ctx) {
       requestId,
       fromAgent: AGENT_NAME,
       message: 'echo-request-id',
+      autoReply: true,
     });
     if (resp.requestId !== requestId) {
       throw new Error(`Expected requestId ${requestId}, got ${resp.requestId}`);
@@ -192,6 +194,7 @@ async function runTests(ctx) {
       requestId: uuidv4(),
       fromAgent: AGENT_NAME,
       message: 'who-are-you',
+      autoReply: true,
     });
     if (!resp.fromAgent) throw new Error('Missing fromAgent in response');
     console.log(`      Peer agent name: "${resp.fromAgent}"`);
@@ -311,6 +314,7 @@ async function runTests(ctx) {
       fromAgent: AGENT_NAME,
       message: 'Say exactly "LLM_OK" and nothing else.',
       autoReply: false,
+      timeoutMs: 120_000,
     });
     const duration = Date.now() - start;
     console.log(`      LLM response in ${duration}ms: "${resp.message.slice(0, 80)}"`);
