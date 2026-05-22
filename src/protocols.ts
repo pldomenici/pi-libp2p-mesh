@@ -26,27 +26,44 @@ import type {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Read the entirety of a libp2p duplex {@link Stream} into a single
- * `Uint8Array`.
+/**
+ * Read the entirety of a libp2p {@link Stream} into a single `Uint8Array`,
+ * respecting an optional {@link AbortSignal} to prevent indefinite hangs.
  *
- * The stream source yields `Uint8ArrayList` chunks; each is converted to a
- * plain `Uint8Array` via `.subarray()` before concatenation.
+ * If the signal fires mid-read, the returned promise rejects with an
+ * `AbortError` that the caller can distinguish from protocol-level errors.
  */
-async function readStream(stream: Stream): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+async function readStream(
+  stream: Stream,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  // Fast path: signal already aborted before we start
+  if (signal?.aborted) {
+    throw new DOMException("readStream aborted before start", "AbortError");
+  }
 
-  for await (const chunk of stream.source) {
-    const uint8 =
-      chunk instanceof Uint8Array
-        ? chunk
-        : (chunk as Uint8ArrayList).subarray();
-    chunks.push(uint8);
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  for await (const raw of stream.source) {
+    // Check for abort between chunks (prevents indefinite hang on
+    // a stream that trickles data but never closes).
+    if (signal?.aborted) {
+      throw new DOMException("readStream aborted mid-read", "AbortError");
+    }
+
+    const chunk =
+      raw instanceof Uint8Array
+        ? raw
+        : (raw as Uint8ArrayList).subarray();
+    chunks.push(chunk);
+    totalBytes += chunk.byteLength;
   }
 
   if (chunks.length === 0) return new Uint8Array(0);
 
-  const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-  const result = new Uint8Array(totalLength);
+  // Single-pass concatenation — only one copy of the data
+  const result = new Uint8Array(totalBytes);
   let offset = 0;
   for (const chunk of chunks) {
     result.set(chunk, offset);
@@ -232,8 +249,9 @@ export class MeshProtocols {
       // Close the write side to signal end-of-request
       await stream.closeWrite({ signal: abortController.signal });
 
-      // Read the full response
-      const raw = await readStream(stream);
+      // Read the full response (abort-aware — prevents indefinite hang if the
+      // remote peer closes write but never sends data)
+      const raw = await readStream(stream, abortController.signal);
       return JSON.parse(new TextDecoder().decode(raw)) as AgentResponse;
     } finally {
       clearTimeout(timeoutId);
