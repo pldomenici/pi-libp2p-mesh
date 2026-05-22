@@ -1,0 +1,37 @@
+{
+  "name": "@earendil-works/pi-libp2p-mesh",
+  "version": "0.1.0",
+  "description": "P2P mesh network extension for pi agents built on libp2p — peer discovery, direct messaging, and gossip broadcast.",
+  "keywords": ["pi-package", "p2p", "libp2p", "mesh", "gossip"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "image": "https://raw.githubusercontent.com/libp2p/js-libp2p/main/img/libp2p-logo.png"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-noise": "^16.1.5",
+    "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/bootstrap": "^11.0.47",
+    "@libp2p/crypto": "5.1.8",
+    "@libp2p/identify": "^3.0.39",
+    "@libp2p/interface": "^2.11.0",
+    "@libp2p/kad-dht": "^14.2.15",
+    "@libp2p/mdns": "^11.0.47",
+    "@libp2p/peer-id": "^5.1.9",
+    "@libp2p/tcp": "^10.1.19",
+    "@libp2p/websockets": "^9.2.19",
+    "@multiformats/multiaddr": "^12.5.1",
+    "libp2p": "^2.10.0",
+    "multiformats": "^13.3.2",
+    "uuid": "^11.1.0"
+  },
+  "overrides": {
+    "@multiformats/dns": "1.0.12"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
