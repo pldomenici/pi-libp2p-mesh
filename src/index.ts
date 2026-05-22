@@ -189,8 +189,8 @@ export default async function (pi: ExtensionAPI) {
 
       // ── LLM Request Queue (FIFO) ────────────────────────────────────────
       // Fixes H4: concurrent onRequest calls no longer race on turn_end.
-      // Each incoming request is enqueued; the queue drains one at a time,
-      // waiting for each turn_end before sending the next message to the LLM.
+      // Uses a single global turn_end listener + activeRequest flag instead
+      // of per-request register/off (pi.off doesn't exist in the ExtensionAPI).
 
       const REQUEST_TIMEOUT_MS = 60_000;
 
@@ -202,8 +202,7 @@ export default async function (pi: ExtensionAPI) {
       };
 
       const requestQueue: PendingRequest[] = [];
-      let queueBusy = false;
-      let turnEndCleanup: (() => void) | null = null;
+      let activeRequest: PendingRequest | null = null;
 
       /** Extract assistant text from a turn_end event. */
       function extractResponseText(msg: any): string {
@@ -218,53 +217,37 @@ export default async function (pi: ExtensionAPI) {
         return "[non-text response]";
       }
 
-      /** Dequeue and process the oldest pending request after a turn_end fires. */
+      /** Dequeue and send the next pending request to the LLM. */
       function advanceQueue() {
-        // Remove the old listener — one-shot per turn
-        if (turnEndCleanup) {
-          turnEndCleanup();
-          turnEndCleanup = null;
-        }
+        // Already waiting for the current request — the turn_end listener
+        // will call this again after it resolves.
+        if (activeRequest) return;
 
-        if (requestQueue.length === 0) {
-          queueBusy = false;
-          return;
-        }
-
-        // Peek ahead — if the next request has already timed out, skip and advance
+        // Skip any entries whose timers have already expired
         while (requestQueue.length > 0) {
-          const next = requestQueue[0];
-          // Not yet timed out? Process it.
-          if (next.timer !== undefined) break;
-          // Already settled (timed out) — remove and try next
+          if (requestQueue[0].timer !== undefined) break;
           requestQueue.shift();
         }
 
-        if (requestQueue.length === 0) {
-          queueBusy = false;
-          return;
-        }
+        if (requestQueue.length === 0) return;
 
-        const entry = requestQueue.shift()!;
-
-        // Register one-shot turn_end listener for this request
-        function onTurnEnd(event: any) {
-          clearTimeout(entry.timer);
-          entry.timer = undefined as any;
-          entry.resolve(extractResponseText(event.message));
-          // Advance the queue for the next request
-          advanceQueue();
-        }
-
-        pi.on("turn_end", onTurnEnd);
-        turnEndCleanup = () => pi.off("turn_end", onTurnEnd);
-
-        // Inject this request's message into the LLM
+        activeRequest = requestQueue.shift()!;
         pi.sendUserMessage(
-          `[Mesh message from ${entry.request.fromAgent}]\n\n${entry.request.message}`,
+          `[Mesh message from ${activeRequest.request.fromAgent}]\n\n${activeRequest.request.message}`,
           { deliverAs: "steer" },
         );
       }
+
+      // ONE global turn_end listener — registered once, never removed
+      pi.on("turn_end", (event) => {
+        if (!activeRequest) return;
+        const req = activeRequest;
+        activeRequest = null;
+        clearTimeout(req.timer);
+        req.timer = undefined as any;
+        req.resolve(extractResponseText(event.message));
+        advanceQueue();
+      });
 
       // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
       meshProtocols.onRequest = (peerId, request) => {
@@ -288,12 +271,7 @@ export default async function (pi: ExtensionAPI) {
 
           const entry: PendingRequest = { peerId, request, resolve, timer };
           requestQueue.push(entry);
-
-          // If queue is idle, kick it off
-          if (!queueBusy) {
-            queueBusy = true;
-            advanceQueue();
-          }
+          advanceQueue();
         });
       };
 
