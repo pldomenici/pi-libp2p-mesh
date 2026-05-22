@@ -51,6 +51,8 @@ export interface AgentRequest {
   timestamp: number;
   /** The prompt / question / task */
   message: string;
+  /** If true (default), auto-reply without involving the LLM. If false, forward to the LLM. */
+  autoReply?: boolean;
 }
 
 export interface AgentResponse {

@@ -26,7 +26,6 @@ import type { MeshConfig, MeshNodeEvent } from "./types";
 import { MeshNode } from "./node";
 import { MeshProtocols } from "./protocols";
 import { registerMeshTools, setMeshProtocols, type MeshStore } from "./tools";
-import { v4 as uuid } from "uuid";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -63,15 +62,37 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
 
 function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
   switch (ev.type) {
-    case "peer:discovered":
-      store.peers.set(ev.peer.id, ev.peer);
+    case "peer:discovered": {
+      const existing = store.peers.get(ev.peer.id);
+      if (existing) {
+        // Merge addresses (discovery may fire after connect/identify)
+        const existingAddrs = new Set(existing.addresses);
+        for (const addr of ev.peer.addresses) existingAddrs.add(addr);
+        existing.addresses = [...existingAddrs];
+        // Don't downgrade from connected to disconnected if we already have an active connection
+        existing.discoveredAt = ev.peer.discoveredAt;
+      } else {
+        store.peers.set(ev.peer.id, ev.peer);
+      }
       if (meshProtocols) meshProtocols.handlePeerDiscovered(ev.peer);
       notify(pi, `Peer discovered: ${ev.peer.id} (${ev.peer.addresses.join(", ")})`);
       break;
+    }
 
     case "peer:connected": {
-      const p = store.peers.get(ev.peerId);
-      if (p) p.status = "connected";
+      let p = store.peers.get(ev.peerId);
+      if (!p) {
+        // Inbound connection before mDNS discovery — create a placeholder
+        p = {
+          id: ev.peerId,
+          addresses: [],
+          status: "connected",
+          discoveredAt: Date.now(),
+        };
+        store.peers.set(ev.peerId, p);
+      } else {
+        p.status = "connected";
+      }
       notify(pi, `Peer connected: ${ev.peerId}`);
       break;
     }
@@ -84,8 +105,18 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
     }
 
     case "peer:identified": {
-      const p = store.peers.get(ev.peerId);
-      if (p && ev.agentName) {
+      let p = store.peers.get(ev.peerId);
+      if (!p) {
+        // Identify before discovery — create a placeholder
+        p = {
+          id: ev.peerId,
+          addresses: [],
+          status: "connected",
+          discoveredAt: Date.now(),
+        };
+        store.peers.set(ev.peerId, p);
+      }
+      if (ev.agentName) {
         p.agentName = ev.agentName;
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
       }
@@ -115,9 +146,9 @@ export default async function (pi: ExtensionAPI) {
   // 0. Register CLI flags
   const hostname = os.hostname();
   pi.registerFlag("agent-name", {
-    description: "Agent name for the P2P mesh (default: pi-<hostname>)",
+    description: `Agent name for the P2P mesh (default: pi-${hostname}, or PI_MESH_NAME env var)`,
     type: "string",
-    default: `pi-${hostname}`,
+    default: "",
   });
   pi.registerFlag("mesh-enable-dht", {
     description: "Enable Kademlia DHT for wide-area peer discovery",
@@ -130,12 +161,16 @@ export default async function (pi: ExtensionAPI) {
     default: "pi-broadcast",
   });
 
-  // Resolve agent name (flag takes priority over UUID fallback)
-  const flagName = pi.getFlag("agent-name") as string;
-  store.agentName = flagName || `pi-${hostname}-${uuid().slice(0, 8)}`;
-
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
+    // Resolve agent name now (CLI flags are parsed at this point):
+    //   1. --agent-name CLI flag (explicit)
+    //   2. PI_MESH_NAME or PI_COMM_NAME env var (backward compat with pi-comm)
+    //   3. Default: pi-<hostname>
+    const flagName = pi.getFlag("agent-name") as string;
+    const envName = process.env.PI_MESH_NAME || process.env.PI_COMM_NAME;
+    store.agentName = flagName || envName || `pi-${hostname}`;
+
     const config = buildConfig(pi);
 
     try {
@@ -148,6 +183,49 @@ export default async function (pi: ExtensionAPI) {
       // Incoming direct messages — forward via pi's event bus
       meshProtocols.onMessage = (_peerId, request) => {
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
+      };
+
+      // Incoming LLM-forward requests (autoReply !== true) — inject into pi's LLM
+      meshProtocols.onRequest = (peerId, request) => {
+        return new Promise<string>((resolve) => {
+          let settled = false;
+
+          const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            resolve(
+              `[timeout] Agent did not respond within 60s to: "${request.message}"`,
+            );
+          }, 60_000);
+
+          pi.on("turn_end", (event) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+
+            const msg = event.message;
+            if (msg && msg.role === "assistant") {
+              const text =
+                typeof msg.content === "string"
+                  ? msg.content
+                  : Array.isArray(msg.content)
+                    ? msg.content
+                        .filter((c: any) => c.type === "text")
+                        .map((c: any) => c.text)
+                        .join("\n")
+                    : "[non-text response]";
+              resolve(text || "[empty response]");
+            } else {
+              resolve("[no assistant response]");
+            }
+          });
+
+          // Inject into pi's processing queue
+          pi.sendUserMessage(
+            `[Mesh message from ${request.fromAgent}]\n\n${request.message}`,
+            { deliverAs: "steer" },
+          );
+        });
       };
 
       // Incoming broadcasts — record in store and notify

@@ -99,10 +99,11 @@ export class MeshNode {
       transports: [tcp(), webSockets()],
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
+      nodeInfo: {
+        userAgent: `pi-libp2p-mesh/${mergedConfig.agentName}`,
+      },
       services: {
-        identify: identify({
-          agentVersion: `pi-libp2p-mesh/${mergedConfig.agentName}`,
-        }),
+        identify: identify(),
         pubsub: gossipsub(),
       },
     };
@@ -261,13 +262,12 @@ export class MeshNode {
     const peerId = detail.peerId.toString();
 
     // Extract agent name from the agentVersion string.
-    // Format: "pi-libp2p-mesh/<agentName>"
+    // Accepts both plain names (e.g. "bob") and prefixed ("pi-libp2p-mesh/bob").
     const agentVersion = detail.agentVersion ?? "";
-    let agentName = "";
     const prefix = "pi-libp2p-mesh/";
-    if (agentVersion.startsWith(prefix)) {
-      agentName = agentVersion.slice(prefix.length);
-    }
+    const agentName = agentVersion.startsWith(prefix)
+      ? agentVersion.slice(prefix.length)
+      : agentVersion;
 
     this.emit({
       type: "peer:identified",

@@ -87,7 +87,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
               .map((p) => {
                 const name = p.agentName ?? "unknown";
                 const addrs = p.addresses.join(", ") || "none";
-                return `  ${p.status === "connected" ? "🟢" : "🔴"} **${name}** (${p.id.slice(0, 12)}…) — ${addrs}`;
+                return `  ${p.status === "connected" ? "🟢" : "🔴"} **${name}** (${p.id}) — ${addrs}`;
               })
               .join("\n");
 
@@ -116,6 +116,13 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
       message: Type.String({
         description: "The prompt, question, or message to send to the peer",
       }),
+      autoReply: Type.Optional(
+        Type.Boolean({
+          description:
+            "If true, the receiver auto-replies without involving its LLM. " +
+            "Defaults to false (message is forwarded to the receiver's LLM).",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, onUpdate) {
@@ -132,7 +139,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
       }
 
       onUpdate?.({
-        content: [{ type: "text", text: `Dialing peer ${params.peerId.slice(0, 12)}…` }],
+        content: [{ type: "text", text: `Dialing peer ${params.peerId}…` }],
       });
 
       try {
@@ -141,6 +148,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
           fromAgent: store.agentName,
           message: params.message,
+          autoReply: params.autoReply,
         });
 
         onUpdate?.({
@@ -158,7 +166,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           content: [
             {
               type: "text",
-              text: `**Response from ${response.fromAgent}** (${params.peerId.slice(0, 12)}…):\n\n${response.message}` +
+              text: `**Response from ${response.fromAgent}** (${params.peerId}):\n\n${response.message}` +
                 (response.error ? "\n\n⚠️ Peer reported an error." : ""),
             },
           ],
@@ -174,7 +182,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           content: [
             {
               type: "text",
-              text: `Failed to reach peer ${params.peerId.slice(0, 12)}…: ${err.message}`,
+              text: `Failed to reach peer ${params.peerId}: ${err.message}`,
             },
           ],
           details: result,
@@ -323,7 +331,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
               .map((p) => {
                 const name = p.agentName ?? "unnamed";
                 const age = Math.round((Date.now() - p.discoveredAt) / 1000);
-                return `  • **${name}** — ${p.id.slice(0, 12)}… (${p.status}, ${age}s ago)`;
+                return `  • **${name}** — ${p.id} (${p.status}, ${age}s ago)`;
               })
               .join("\n");
 

@@ -105,6 +105,7 @@ export class MeshProtocols {
 
   private _onMessage?: (peerId: string, request: AgentRequest) => void;
   private _onBroadcast?: (msg: BroadcastMessage) => void;
+  private _onRequest?: (peerId: string, request: AgentRequest) => Promise<string>;
 
   /**
    * @param libp2p - A started libp2p v2 node instance.
@@ -165,6 +166,16 @@ export class MeshProtocols {
     this._onBroadcast = cb;
   }
 
+  /**
+   * Register a callback invoked when a request with autoReply=false is received.
+   * The callback receives the peer ID and request, and must return the response text.
+   *
+   * @param cb - Async handler returning the response string to send back.
+   */
+  set onRequest(cb: (peerId: string, request: AgentRequest) => Promise<string>) {
+    this._onRequest = cb;
+  }
+
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
@@ -192,6 +203,7 @@ export class MeshProtocols {
       ...request,
       fromPeerId: this.libp2p.peerId.toString(),
       timestamp: Date.now(),
+      autoReply: request.autoReply,
     };
 
     // Create an AbortController for the 30-second timeout
@@ -338,13 +350,25 @@ export class MeshProtocols {
         new TextDecoder().decode(raw),
       );
 
-      // Build an automatic echo response
+      let responseMessage: string;
+
+      if (request.autoReply === true) {
+        // Explicit auto-reply: echo without involving the LLM
+        responseMessage = `[auto-response] Received: "${request.message}"`;
+      } else if (this._onRequest) {
+        // Forward to LLM (default behavior when autoReply is not true)
+        responseMessage = await this._onRequest(peerIdStr, request);
+      } else {
+        // Fallback: no LLM handler registered
+        responseMessage = `[auto-response] Received (no LLM handler): "${request.message}"`;
+      }
+
       const response: AgentResponse = {
         requestId: request.requestId,
         fromAgent: this.config.agentName,
         fromPeerId: this.libp2p.peerId.toString(),
         timestamp: Date.now(),
-        message: `[auto-response] Received: "${request.message}"`,
+        message: responseMessage,
         error: false,
       };
 
@@ -355,7 +379,7 @@ export class MeshProtocols {
         })(),
       );
 
-      // Notify the registered callback
+      // Notify the registered callback (for logging/side effects)
       this._onMessage?.(peerIdStr, request);
     } catch (err) {
       console.error('[mesh-protocols] error handling incoming message:', err);
