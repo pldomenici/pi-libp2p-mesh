@@ -12,6 +12,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { Libp2p, Stream, PubSub, Message } from '@libp2p/interface';
+import type { GossipsubMessage } from '@chainsafe/libp2p-gossipsub';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import type {
   AgentRequest,
@@ -134,7 +135,10 @@ export class MeshProtocols {
     const pubsub = this.resolvePubsub();
     if (pubsub != null) {
       pubsub.subscribe(topic);
-      pubsub.addEventListener('message', (event: CustomEvent<Message>) => {
+      // NOTE: GossipSub emits 'gossipsub:message', not 'message'.
+      // The detail is GossipsubMessage { msg, propagationSource, msgId },
+      // not a bare libp2p Message.
+      pubsub.addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
         this.handleGossipMessage(event).catch((err: unknown) =>
           console.error('[mesh-protocols] gossip handler error:', err),
         );
@@ -277,9 +281,10 @@ export class MeshProtocols {
     const data = encoder.encode(JSON.stringify(fullMessage));
     const result = await pubsub.publish(topic, data);
 
-    // Determine the number of subscribers reached
+    // Determine the number of subscribers reached.
+    // GossipSub publish result may include recipients; fall back to topic subscriber count.
     const peersReached: number =
-      result.recipients?.length ?? pubsub.getSubscribers(topic).length;
+      (result as any).recipients?.length ?? pubsub.getSubscribers(topic).length;
 
     return {
       topic,
@@ -399,9 +404,9 @@ export class MeshProtocols {
    * `onBroadcast` callback.
    */
   private async handleGossipMessage(
-    event: CustomEvent<Message>,
+    event: CustomEvent<GossipsubMessage>,
   ): Promise<void> {
-    const message: Message = event.detail;
+    const { msg: message } = event.detail;
     const raw = new TextDecoder().decode(message.data);
     const broadcastMsg: BroadcastMessage = JSON.parse(raw);
 

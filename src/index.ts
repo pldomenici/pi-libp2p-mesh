@@ -25,7 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types";
 import { MeshNode } from "./node";
 import { MeshProtocols } from "./protocols";
-import { registerMeshTools, setMeshProtocols, type MeshStore } from "./tools";
+import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, type MeshStore } from "./tools";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -39,6 +39,7 @@ const store: MeshStore = {
   peers: new Map(),
   broadcastHistory: [],
   agentName: "", // set during extension init after flag is read
+  autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -187,6 +188,13 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming LLM-forward requests (autoReply !== true) — inject into pi's LLM
       meshProtocols.onRequest = (peerId, request) => {
+        // If global auto-reply-all is on, echo without LLM
+        if (store.autoReplyAll) {
+          return Promise.resolve(
+            `[auto-reply-all] Received: "${request.message}"`,
+          );
+        }
+
         return new Promise<string>((resolve) => {
           let settled = false;
 
@@ -228,9 +236,19 @@ export default async function (pi: ExtensionAPI) {
         });
       };
 
-      // Incoming broadcasts — record in store and notify
+      // Incoming broadcasts — record in store, notify, and optionally forward to LLM
       meshProtocols.onBroadcast = (msg) => {
         handleNodeEvent(pi, { type: "broadcast", message: msg });
+
+        // If auto-reply-all is off, forward the broadcast to the LLM so the agent
+        // can process it (e.g. for coordination, awareness of announcements, etc.).
+        // Broadcasts are fire-and-forget (no response expected).
+        if (!store.autoReplyAll) {
+          pi.sendUserMessage(
+            `[Mesh broadcast from ${msg.fromAgent} (${msg.type ?? "announce"})]\n\n${msg.message}`,
+            { deliverAs: "steer" },
+          );
+        }
       };
 
       // Forward node events into our handler
@@ -266,20 +284,115 @@ export default async function (pi: ExtensionAPI) {
   // 3. Register mesh tools
   registerMeshTools(pi, store);
 
-  // 4. Register a command for manual control
-  pi.registerCommand("mesh-status", {
-    description: "Show mesh network status",
+  // 4. Register commands for manual control
+  pi.registerCommand("auto-reply", {
+    description: "Toggle auto-reply mode (when on, all incoming mesh messages echo without LLM)",
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase();
+      if (arg === "on" || arg === "true" || arg === "1") {
+        store.autoReplyAll = true;
+        ctx.ui.notify("Auto-reply: ON — incoming mesh messages will echo without LLM", "info");
+      } else if (arg === "off" || arg === "false" || arg === "0") {
+        store.autoReplyAll = false;
+        ctx.ui.notify("Auto-reply: off — incoming mesh messages will be forwarded to LLM", "info");
+      } else if (arg === "") {
+        // Toggle
+        store.autoReplyAll = !store.autoReplyAll;
+        ctx.ui.notify(
+          `Auto-reply: ${store.autoReplyAll ? "ON" : "off"}`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify(
+          `Usage: /auto-reply [on|off] — current: ${store.autoReplyAll ? "ON" : "off"}`,
+          "warn",
+        );
+      }
+    },
+  });
+
+  pi.registerCommand("mesh-list-peers", {
+    description: "List all peers on the P2P mesh network",
     handler: async (_args, ctx) => {
       if (!meshNode) {
         ctx.ui.notify("Mesh node not running", "warn");
         return;
       }
 
-      const connected = [...store.peers.values()].filter(
-        (p) => p.status === "connected",
-      );
+      const { peers, connected, total } = listPeers(store);
+
+      if (total === 0) {
+        ctx.ui.notify("No peers discovered. Use mesh_discover to scan.", "info");
+        return;
+      }
+
+      const lines = peers.map((p) => {
+        const icon = p.status === "connected" ? "🟢" : "🔴";
+        const name = p.agentName ?? "unknown";
+        const age = Math.round((Date.now() - p.discoveredAt) / 1000);
+        return `${icon} ${name} — ${p.id.slice(0, 16)}… (${p.status}, ${age}s ago)`;
+      });
+
       ctx.ui.notify(
-        `Mesh: ${connected.length}/${store.peers.size} peers connected | Node: ${meshNode.peerId}`,
+        `${connected}/${total} peers:\n${lines.join("\n")}`,
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("mesh-discover", {
+    description: "Scan for new peers on the P2P mesh network",
+    handler: async (_args, ctx) => {
+      if (!meshNode) {
+        ctx.ui.notify("Mesh node not running", "warn");
+        return;
+      }
+
+      ctx.ui.notify("Scanning network for new peers…", "info");
+
+      const { peers, connected, total } = listPeers(store);
+      const newPeers = peers.filter(
+        (p) => Date.now() - p.discoveredAt < 10_000,
+      );
+
+      if (total === 0) {
+        ctx.ui.notify(
+          "No peers discovered. Ensure other pi agents with pi-libp2p-mesh are running on the same network.",
+          "warn",
+        );
+        return;
+      }
+
+      const lines = peers.map((p) => {
+        const icon = p.status === "connected" ? "🟢" : "🔴";
+        const name = p.agentName ?? "unknown";
+        const age = Math.round((Date.now() - p.discoveredAt) / 1000);
+        return `${icon} ${name} — ${p.id} (${p.status}, ${age}s ago)`;
+      });
+
+      ctx.ui.notify(
+        `${connected}/${total} peers (${newPeers.length} recently discovered):\n${lines.join("\n")}`,
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("mesh-prune", {
+    description: "Remove all disconnected/stale peers from the peer list",
+    handler: async (_args, ctx) => {
+      if (!meshNode) {
+        ctx.ui.notify("Mesh node not running", "warn");
+        return;
+      }
+
+      const { total: before, connected } = listPeers(store);
+      const removed = pruneAllDisconnected(store);
+      const { total: after } = listPeers(store);
+
+      ctx.ui.notify(
+        removed === 0
+          ? `No stale peers to prune. All ${before} peer(s) connected.`
+          : `🧹 Pruned ${removed} stale peer(s). ${before} → ${after} (${connected} connected)`,
         "info",
       );
     },

@@ -31,6 +31,8 @@ export interface MeshStore {
   peers: Map<string, MeshPeer>;
   broadcastHistory: BroadcastMessage[];
   agentName: string;
+  /** When true, all incoming messages auto-reply without involving the LLM. */
+  autoReplyAll: boolean;
 }
 
 /** Module-level reference — set by index.ts after session_start. */
@@ -42,6 +44,82 @@ let meshProtocols: MeshProtocols | null = null;
  */
 export function setMeshProtocols(protocols: MeshProtocols): void {
   meshProtocols = protocols;
+}
+
+// ── Helpers (shared between tools and commands) ──────────────────────────────
+
+const STALE_PEER_MS = 60 * 1000;
+
+/**
+ * Remove stale/disconnected peers using two strategies:
+ * 1. Agent-name dedup — when two entries share the same agentName, keep only the
+ *    connected one (the disconnected entry is from a previous session that restarted).
+ * 2. Time-based — remove peers disconnected for more than STALE_PEER_MS (30s).
+ */
+export function pruneStalePeers(store: MeshStore): void {
+  const now = Date.now();
+
+  // Strategy 1: agent-name dedup — same name, keep connected, remove disconnected
+  const byName = new Map<string, MeshPeer[]>();
+  for (const [, peer] of store.peers) {
+    if (peer.agentName) {
+      const entries = byName.get(peer.agentName) ?? [];
+      entries.push(peer);
+      byName.set(peer.agentName, entries);
+    }
+  }
+  for (const [, entries] of byName) {
+    if (entries.length > 1) {
+      const connected = entries.filter((p) => p.status === "connected");
+      if (connected.length > 0) {
+        // Keep connected entry, remove disconnected ones with same name
+        for (const entry of entries) {
+          if (entry.status === "disconnected") {
+            store.peers.delete(entry.id);
+          }
+        }
+      }
+    }
+  }
+
+  // Strategy 2: time-based cleanup
+  for (const [id, peer] of store.peers) {
+    if (peer.status === "disconnected") {
+      const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
+      if (now - lastSeen > STALE_PEER_MS) {
+        store.peers.delete(id);
+      }
+    }
+  }
+}
+
+/**
+ * Aggressively prune ALL disconnected peers immediately (ignoring time threshold).
+ * Returns count of removed entries.
+ */
+export function pruneAllDisconnected(store: MeshStore): number {
+  let removed = 0;
+  for (const [id, peer] of store.peers) {
+    if (peer.status === "disconnected") {
+      store.peers.delete(id);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+export interface PeerListResult {
+  peers: MeshPeer[];
+  connected: number;
+  total: number;
+}
+
+/** Get current peer list after pruning stale entries. */
+export function listPeers(store: MeshStore): PeerListResult {
+  pruneStalePeers(store);
+  const peers = [...store.peers.values()];
+  const connected = peers.filter((p) => p.status === "connected").length;
+  return { peers, connected, total: peers.length };
 }
 
 // ── Tool Registration ────────────────────────────────────────────────────────
@@ -63,21 +141,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     parameters: Type.Object({}),
 
     async execute() {
-      // Prune stale peers (disconnected > 5 minutes, never connected)
-      const now = Date.now();
-      const STALE_MS = 5 * 60 * 1000;
-      for (const [id, peer] of store.peers) {
-        if (peer.status === "disconnected") {
-          const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
-          if (now - lastSeen > STALE_MS) {
-            store.peers.delete(id);
-          }
-        }
-      }
-
-      const peers = [...store.peers.values()];
-      const connected = peers.filter((p) => p.status === "connected").length;
-      const total = peers.length;
+      const { peers, connected, total } = listPeers(store);
 
       const text =
         total === 0
@@ -290,21 +354,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         content: [{ type: "text", text: "Scanning network for new peers…" }],
       });
 
-      // Prune stale peers
-      const now = Date.now();
-      const STALE_MS = 5 * 60 * 1000;
-      for (const [id, peer] of store.peers) {
-        if (peer.status === "disconnected") {
-          const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
-          if (now - lastSeen > STALE_MS) {
-            store.peers.delete(id);
-          }
-        }
-      }
-
-      // mDNS and DHT discovery is continuous. We report the current state,
-      // which includes all peers found since the node started (or last /reload).
-      const peers = [...store.peers.values()];
+      const { peers, total } = listPeers(store);
       const newPeers = peers.filter(
         (p) => Date.now() - p.discoveredAt < 10_000,
       );
@@ -338,6 +388,37 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
       return {
         content: [{ type: "text", text }],
         details: result,
+      };
+    },
+  });
+
+  // ── mesh_prune ────────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "mesh_prune",
+    label: "Prune Stale Peers",
+    description:
+      "Remove disconnected/stale peers from the peer list. " +
+      "Use this to clean up old peer entries from restarted agents that now have new PeerIds.",
+    promptSnippet: "Remove stale/disconnected peers from the mesh peer list",
+    promptGuidelines: [
+      "Use mesh_prune after agents restart (they get new PeerIds) to clean up disconnected entries.",
+    ],
+    parameters: Type.Object({}),
+
+    async execute() {
+      const { peers, connected, total } = listPeers(store);
+      const before = total;
+      const removed = pruneAllDisconnected(store);
+      const { total: after } = listPeers(store);
+
+      const text =
+        removed === 0
+          ? `No stale peers to prune. All ${before} peer(s) are connected.`
+          : `🧹 Pruned ${removed} stale peer(s). Before: ${before}, after: ${after} (${connected} connected).`;
+
+      return {
+        content: [{ type: "text", text }],
+        details: { removed, before, after, connected },
       };
     },
   });
