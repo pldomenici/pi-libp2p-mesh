@@ -12,14 +12,13 @@ import { webSockets } from "@libp2p/websockets";
 import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { mdns } from "@libp2p/mdns";
-import { identify, type IdentifyResult } from "@libp2p/identify";
+import { identify } from "@libp2p/identify";
 import { kadDHT, removePrivateAddressesMapper } from "@libp2p/kad-dht";
 import { bootstrap } from "@libp2p/bootstrap";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
-import { generateKeyPair } from "@libp2p/crypto/keys";
-import { peerIdFromPrivateKey, peerIdFromString } from "@libp2p/peer-id";
-import { type Multiaddr } from "@multiformats/multiaddr";
-import type { PeerId } from "@libp2p/interface";
+import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
+import { peerIdFromString } from "@libp2p/peer-id";
+import type { PeerId, PrivateKey, IdentifyResult } from "@libp2p/interface";
 
 import {
   type MeshConfig,
@@ -27,7 +26,7 @@ import {
   type MeshNodeEvent,
   type MeshNodeEventHandler,
   DEFAULT_CONFIG,
-} from "./types";
+} from "./types.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -61,7 +60,7 @@ export class MeshNode {
   isRunning = false;
 
   private eventHandlers: MeshNodeEventHandler[] = [];
-  private config: MeshConfig;
+  declare private config: MeshConfig;
 
   // ── H2: Internal peer store ──────────────────────────────────────────
   // Persists peers across connect/disconnect cycles so disconnected peers
@@ -96,18 +95,15 @@ export class MeshNode {
     const mergedConfig = { ...DEFAULT_CONFIG, ...config };
 
     // M1: Accept a pre-existing private key for stable identity across restarts.
-    // If provided, derive the PeerId directly; otherwise generate a fresh keypair.
-    let privateKey: Uint8Array;
-    let peerId: import("@libp2p/interface").PeerId;
+    // If provided, derive the PeerId from the seed; otherwise generate a fresh keypair.
+    let privateKey: PrivateKey;
 
     if (mergedConfig.privateKey) {
-      // Reuse caller-supplied key (e.g. from persistent storage)
-      privateKey = mergedConfig.privateKey;
-      peerId = peerIdFromPrivateKey(privateKey);
+      // Recreate the key from a persistent seed (raw Uint8Array)
+      privateKey = await generateKeyPairFromSeed("Ed25519", mergedConfig.privateKey);
     } else {
       // Generate a new Ed25519 keypair (expensive — avoid on every restart)
       privateKey = await generateKeyPair("Ed25519");
-      peerId = peerIdFromPrivateKey(privateKey);
     }
 
     // Assemble libp2p options
@@ -147,7 +143,8 @@ export class MeshNode {
 
     // Kademlia DHT for wider-area discovery
     if (mergedConfig.enableDht) {
-      libp2pConfig.services.dht = kadDHT({
+      const cfg = libp2pConfig as any;
+      cfg.services.dht = kadDHT({
         protocol: "/ipfs/kad/1.0.0",
         peerInfoMapper: removePrivateAddressesMapper,
       });
@@ -320,7 +317,7 @@ export class MeshNode {
     if (peerIdStr === this.peerId) return;
 
     const addrs =
-      detail.multiaddrs?.map((ma: Multiaddr) => ma.toString()) ?? [];
+      detail.multiaddrs?.map((ma: any) => ma.toString()) ?? [];
     const existing = this.peerStore.get(peerIdStr);
 
     if (existing) {

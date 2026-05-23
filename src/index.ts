@@ -22,10 +22,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { MeshConfig, MeshNodeEvent } from "./types";
-import { MeshNode } from "./node";
-import { MeshProtocols } from "./protocols";
-import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools";
+import type { MeshConfig, MeshNodeEvent } from "./types.js";
+import { MeshNode } from "./node.js";
+import { MeshProtocols } from "./protocols.js";
+import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -45,8 +45,7 @@ const store: MeshStore = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function notify(pi: ExtensionAPI, msg: string, level: "info" | "warn" | "error" = "info") {
-  // We access ctx.ui.notify via events; for direct use we fire-and-forget.
+function notify(_pi: ExtensionAPI, msg: string, level: "info" | "warning" | "error" = "info") {
   console.log(`[pi-libp2p-mesh] ${level}: ${msg}`);
 }
 
@@ -193,12 +192,15 @@ export default async function (pi: ExtensionAPI) {
       // of per-request register/off (pi.off doesn't exist in the ExtensionAPI).
 
       const REQUEST_TIMEOUT_MS = 60_000;
+      const MAX_QUEUE_SIZE = 50;
 
       type PendingRequest = {
         peerId: string;
-        request: import("./types").AgentRequest;
+        request: import("./types.js").AgentRequest;
         resolve: (text: string) => void;
         timer: ReturnType<typeof setTimeout>;
+        /** Set to true when the timeout fires before the entry reaches the LLM. */
+        timedOut: boolean;
       };
 
       const requestQueue: PendingRequest[] = [];
@@ -223,9 +225,8 @@ export default async function (pi: ExtensionAPI) {
         // will call this again after it resolves.
         if (activeRequest) return;
 
-        // Skip any entries whose timers have already expired
-        while (requestQueue.length > 0) {
-          if (requestQueue[0].timer !== undefined) break;
+        // Discard entries whose timeouts already fired (they resolved via timeout)
+        while (requestQueue.length > 0 && requestQueue[0].timedOut) {
           requestQueue.shift();
         }
 
@@ -244,7 +245,6 @@ export default async function (pi: ExtensionAPI) {
         const req = activeRequest;
         activeRequest = null;
         clearTimeout(req.timer);
-        req.timer = undefined as any;
         req.resolve(extractResponseText(event.message));
         advanceQueue();
       });
@@ -258,18 +258,30 @@ export default async function (pi: ExtensionAPI) {
           );
         }
 
-        return new Promise<string>((resolve) => {
-          let settled = false;
+        // Backpressure: reject the request immediately if queue is full
+        if (requestQueue.length >= MAX_QUEUE_SIZE) {
+          return Promise.resolve(
+            `[queue-full] Agent request queue is full (max ${MAX_QUEUE_SIZE}). Please retry later.`,
+          );
+        }
 
-          const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
+        return new Promise<string>((resolve) => {
+          const entry: PendingRequest = {
+            peerId,
+            request,
+            resolve,
+            timer: undefined as any,
+            timedOut: false,
+          };
+
+          entry.timer = setTimeout(() => {
+            // Mark as timed out so advanceQueue() will skip it
+            entry.timedOut = true;
             resolve(
               `[timeout] Agent did not respond within ${REQUEST_TIMEOUT_MS / 1000}s to: "${request.message}"`,
             );
           }, REQUEST_TIMEOUT_MS);
 
-          const entry: PendingRequest = { peerId, request, resolve, timer };
           requestQueue.push(entry);
           advanceQueue();
         });
@@ -358,7 +370,7 @@ export default async function (pi: ExtensionAPI) {
       } else {
         ctx.ui.notify(
           `Usage: /auto-reply [on|off] — current: ${store.autoReplyAll ? "ON" : "off"}`,
-          "warn",
+          "warning",
         );
       }
     },
@@ -368,7 +380,7 @@ export default async function (pi: ExtensionAPI) {
     description: "List all peers on the P2P mesh network",
     handler: async (_args, ctx) => {
       if (!meshNode) {
-        ctx.ui.notify("Mesh node not running", "warn");
+        ctx.ui.notify("Mesh node not running", "warning");
         return;
       }
 
@@ -397,7 +409,7 @@ export default async function (pi: ExtensionAPI) {
     description: "Scan for new peers on the P2P mesh network",
     handler: async (_args, ctx) => {
       if (!meshNode) {
-        ctx.ui.notify("Mesh node not running", "warn");
+        ctx.ui.notify("Mesh node not running", "warning");
         return;
       }
 
@@ -411,7 +423,7 @@ export default async function (pi: ExtensionAPI) {
       if (total === 0) {
         ctx.ui.notify(
           "No peers discovered. Ensure other pi agents with pi-libp2p-mesh are running on the same network.",
-          "warn",
+          "warning",
         );
         return;
       }
@@ -434,7 +446,7 @@ export default async function (pi: ExtensionAPI) {
     description: "Remove all disconnected/stale peers from the peer list",
     handler: async (_args, ctx) => {
       if (!meshNode) {
-        ctx.ui.notify("Mesh node not running", "warn");
+        ctx.ui.notify("Mesh node not running", "warning");
         return;
       }
 

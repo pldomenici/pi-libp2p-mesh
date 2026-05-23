@@ -15,8 +15,6 @@
  *       mesh_discover     – trigger an active peer discovery scan
  */
 
-import type { PeerId } from "@libp2p/interface";
-
 // ── Peer ─────────────────────────────────────────────────────────────────────
 
 export interface MeshPeer {
@@ -25,7 +23,7 @@ export interface MeshPeer {
   /** Multiaddrs this peer is reachable at */
   addresses: string[];
   /** Connection state */
-  status: "connected" | "disconnected" | "connecting";
+  status: "connected" | "disconnected";
   /** Agent name (discovered via Identify protocol handshake) */
   agentName?: string;
   /** When this peer was first seen (epoch ms) */

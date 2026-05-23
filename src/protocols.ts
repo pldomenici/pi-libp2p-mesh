@@ -11,7 +11,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { Libp2p, Stream, PubSub, Message } from '@libp2p/interface';
+import type { Libp2p, Stream, PubSub } from '@libp2p/interface';
 import type { GossipsubMessage } from '@chainsafe/libp2p-gossipsub';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import type {
@@ -155,7 +155,9 @@ export class MeshProtocols {
       // NOTE: GossipSub emits 'gossipsub:message', not 'message'.
       // The detail is GossipsubMessage { msg, propagationSource, msgId },
       // not a bare libp2p Message.
-      pubsub.addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
+      // Cast needed: GossipSub emits 'gossipsub:message' which is not in the
+      // base PubSubEvents type — only GossipSub (not generic PubSub) has this.
+      (pubsub as any).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
         this.handleGossipMessage(event).catch((err: unknown) =>
           console.error('[mesh-protocols] gossip handler error:', err),
         );
@@ -240,15 +242,15 @@ export class MeshProtocols {
       });
 
       // Write the request to the stream
+      // (signal is passed via the abort controller on the dialProtocol call)
       await stream.sink(
         (async function* () {
           yield encoder.encode(JSON.stringify(fullRequest));
         })(),
-        { signal: abortController.signal },
       );
 
       // Close the write side to signal end-of-request
-      await stream.closeWrite({ signal: abortController.signal });
+      await stream.closeWrite();
 
       // Read the full response (abort-aware — prevents indefinite hang if the
       // remote peer closes write but never sends data)
@@ -463,12 +465,11 @@ export class MeshProtocols {
    * @returns The `PubSub` instance, or `null` if not available.
    */
   private resolvePubsub(): PubSub | null {
-    const svc = (this.libp2p as Record<string, unknown>).services as
-      | Record<string, unknown>
-      | undefined;
+    const libp2pAny = this.libp2p as unknown as Record<string, unknown>;
+    const svc = libp2pAny.services as Record<string, unknown> | undefined;
     if (svc?.pubsub != null) return svc.pubsub as PubSub;
-    if ((this.libp2p as Record<string, unknown>).pubsub != null) {
-      return (this.libp2p as Record<string, unknown>).pubsub as PubSub;
+    if (libp2pAny.pubsub != null) {
+      return libp2pAny.pubsub as PubSub;
     }
     return null;
   }

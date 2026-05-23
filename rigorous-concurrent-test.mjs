@@ -813,6 +813,200 @@ async function phase9_ErrorHandling(ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PHASE 10: FIFO LLM Request Queue
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * FIFO queue logic extracted from src/index.ts for isolated testing.
+ * Validates ordering, capacity, backpressure, timeout handling, and
+ * stale-entry skipping — all without involving a real LLM.
+ */
+class FifoQueue {
+  constructor() {
+    this.requestQueue = [];
+    this.activeRequest = null;
+    this.timeoutCount = 0;
+    this.rejectCount = 0;
+    this.llmCallCount = 0;
+    this.resolvedValues = [];
+  }
+
+  completeActive(responseText) {
+    if (!this.activeRequest) throw new Error('No active request');
+    const req = this.activeRequest;
+    this.activeRequest = null;
+    clearTimeout(req.timer);
+    req.resolve(responseText);
+    this.resolvedValues.push(responseText);
+    this.advanceQueue();
+  }
+
+  async send(peerId, message, timeoutMs = 60_000, maxQueueSize = 50) {
+    if (this.requestQueue.length >= maxQueueSize) {
+      this.rejectCount++;
+      return '[queue-full]';
+    }
+    return new Promise((resolve) => {
+      const entry = { peerId, message, resolve, timer: undefined, timedOut: false };
+      entry.timer = setTimeout(() => {
+        entry.timedOut = true;
+        resolve('[timeout]');
+        this.resolvedValues.push('[timeout]');
+        this.timeoutCount++;
+      }, timeoutMs);
+      this.requestQueue.push(entry);
+      this.advanceQueue();
+    });
+  }
+
+  advanceQueue() {
+    if (this.activeRequest) return;
+    while (this.requestQueue.length > 0 && this.requestQueue[0].timedOut) {
+      this.requestQueue.shift();
+    }
+    if (this.requestQueue.length === 0) return;
+    this.activeRequest = this.requestQueue.shift();
+    this.llmCallCount++;
+  }
+
+  get queueLength() { return this.requestQueue.length; }
+  get isActive() { return this.activeRequest !== null; }
+  get llmCalls() { return this.llmCallCount; }
+}
+
+async function phase10_FifoQueue(ctx) {
+  let passed = 0, failed = 0;
+
+  console.log('  ── FIFO queue unit tests (8 scenarios) ──');
+
+  // Helper
+  function assert(cond, msg) { if (!cond) throw new Error(msg); }
+  function assertEq(act, exp, label) {
+    if (act !== exp) throw new Error(`${label}: expected ${JSON.stringify(exp)}, got ${JSON.stringify(act)}`);
+  }
+
+  // 10a: FIFO ordering
+  try {
+    const q = new FifoQueue();
+    const p1 = q.send('a', 'msg-1', 5000);
+    const p2 = q.send('b', 'msg-2', 5000);
+    const p3 = q.send('c', 'msg-3', 5000);
+    assert(q.isActive && q.queueLength === 2 && q.llmCalls === 1, 'First active, 2 queued');
+    q.completeActive('resp-1'); assert((await p1) === 'resp-1');
+    q.completeActive('resp-2'); assert((await p2) === 'resp-2');
+    q.completeActive('resp-3'); assert((await p3) === 'resp-3');
+    assert(!q.isActive && q.queueLength === 0 && q.llmCalls === 3, 'All processed');
+    console.log('      ✅ FIFO ordering — 3 messages processed in order');
+    passed++;
+  } catch (err) { console.log(`      ❌ FIFO ordering: ${err.message}`); failed++; }
+
+  // 10b: Only one active at a time
+  try {
+    const q = new FifoQueue();
+    q.send('a', 'm1', 5000); q.send('b', 'm2', 5000); q.send('c', 'm3', 5000);
+    assertEq(q.llmCalls, 1, 'Only 1 active');
+    assertEq(q.queueLength, 2, '2 queued');
+    q.completeActive('r1'); assertEq(q.llmCalls, 2, '2 after completing');
+    q.completeActive('r2'); assertEq(q.llmCalls, 3, '3 after completing');
+    console.log('      ✅ Single active — only one LLM call at a time');
+    passed++;
+  } catch (err) { console.log(`      ❌ Single active: ${err.message}`); failed++; }
+
+  // 10c: Backpressure at capacity
+  try {
+    const q = new FifoQueue();
+    for (let i = 0; i < 51; i++) q.send(`p-${i}`, `m-${i}`, 500);
+    assertEq(q.queueLength, 50, '50 queued (1 active)');
+    assertEq(q.llmCalls, 1, '1 active');
+    const rej = await q.send('overflow', 'x', 500);
+    assertEq(rej, '[queue-full]', 'Overflow rejected');
+    assertEq(q.rejectCount, 1, '1 rejection');
+    while (q.isActive) q.completeActive('clean');
+    console.log('      ✅ Backpressure — queue full rejection works');
+    passed++;
+  } catch (err) { console.log(`      ❌ Backpressure: ${err.message}`); failed++; }
+
+  // 10d: Timed-out entries skipped
+  try {
+    const q = new FifoQueue();
+    const p1 = q.send('a', 'keep', 5000);
+    const p2 = q.send('b', 'die', 50);
+    const p3 = q.send('c', 'keep2', 5000);
+    await new Promise(r => setTimeout(r, 120));
+    assert((await p2) === '[timeout]', 'p2 timed out');
+    assertEq(q.timeoutCount, 1, '1 timeout');
+    q.completeActive('r1');
+    assert((await p1) === 'r1', 'p1 normal');
+    assert(q.isActive, 'p3 became active (p2 skipped)');
+    assertEq(q.llmCalls, 2, '2 LLM calls (p1, p3)');
+    q.completeActive('r3');
+    assert((await p3) === 'r3', 'p3 normal');
+    console.log('      ✅ Stale skip — timed-out entries bypassed by advanceQueue');
+    passed++;
+  } catch (err) { console.log(`      ❌ Stale skip: ${err.message}`); failed++; }
+
+  // 10e: All timed-out, queue drains
+  try {
+    const q = new FifoQueue();
+    const p1 = q.send('a', 'stay', 5000);
+    for (let i = 1; i < 5; i++) q.send(`p-${i}`, `die-${i}`, 50);
+    await new Promise(r => setTimeout(r, 120));
+    for (let i = 1; i < 5; i++) assert((await q.send('x', 'y', 50)).startsWith('[queue-full]')); // actually wait for them
+    // Actually let's just await our promises
+    assertEq(q.timeoutCount, 4, '4 timeouts');
+    q.completeActive('r1');
+    assert(!q.isActive && q.queueLength === 0, 'Queue empty after skipping timed-out');
+    assertEq(q.llmCalls, 1, 'Only 1 LLM call (p1)');
+    assert((await p1) === 'r1', 'p1 normal');
+    console.log('      ✅ All timed-out — queue fully drains');
+    passed++;
+  } catch (err) { console.log(`      ❌ All timed-out: ${err.message}`); failed++; }
+
+  // 10f: No cross-talk
+  try {
+    const q = new FifoQueue();
+    const p1 = q.send('a', 'hello', 5000);
+    const p2 = q.send('b', 'world', 5000);
+    q.completeActive('resp-hello');
+    q.completeActive('resp-world');
+    assert((await p1) === 'resp-hello', 'p1 correct');
+    assert((await p2) === 'resp-world', 'p2 correct');
+    console.log('      ✅ No cross-talk — each message gets correct response');
+    passed++;
+  } catch (err) { console.log(`      ❌ No cross-talk: ${err.message}`); failed++; }
+
+  // 10g: Bulk sequential
+  try {
+    const q = new FifoQueue();
+    const promises = [];
+    for (let i = 0; i < 10; i++) promises.push(q.send(`p-${i}`, `msg-${i}`, 5000));
+    for (let i = 0; i < 10; i++) q.completeActive(`resp-${i}`);
+    const results = await Promise.all(promises);
+    for (let i = 0; i < 10; i++) assertEq(results[i], `resp-${i}`, `Response ${i}`);
+    assertEq(q.resolvedValues.length, 10, 'All 10 resolved');
+    console.log('      ✅ Bulk sequential — 10 messages all in order');
+    passed++;
+  } catch (err) { console.log(`      ❌ Bulk sequential: ${err.message}`); failed++; }
+
+  // 10h: Queue below capacity accepted
+  try {
+    const q = new FifoQueue();
+    for (let i = 0; i < 49; i++) q.send(`p-${i}`, `m-${i}`, 500);
+    const p50 = q.send('p-50', 'm-50', 500);
+    assertEq(q.queueLength, 49, '49 queued (1 active)');
+    assertEq(q.llmCalls, 1, '1 active');
+    while (q.isActive) q.completeActive('clean');
+    await p50;
+    console.log('      ✅ Below capacity — entry accepted when queue has room');
+    passed++;
+  } catch (err) { console.log(`      ❌ Below capacity: ${err.message}`); failed++; }
+
+  // Summary
+  console.log(`      FIFO queue: ${passed}/8 passed`);
+  return { passed, failed };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -833,6 +1027,7 @@ async function main() {
       phase('7. Message Integrity (Unicode, JSON, Binary)', phase7_MessageIntegrity),
       phase('8. Concurrent Mixed Workload', phase8_ConcurrentMixedWorkload),
       phase('9. Error Handling & Edge Cases', phase9_ErrorHandling),
+      phase('10. FIFO Queue', phase10_FifoQueue),
     ];
 
     const summary = await runPhases(ctx, testPhases);

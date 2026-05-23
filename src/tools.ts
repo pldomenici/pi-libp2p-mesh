@@ -9,8 +9,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { Type, type TSchema } from "typebox";
+
+/**
+ * Create a TypeBox union of string literal types from a const array.
+ */
+function StringEnum<T extends readonly string[]>(values: T): TSchema {
+  return Type.Union(values.map((v) => Type.Literal(v)));
+}
 
 import type {
   MeshPeer,
@@ -18,8 +24,8 @@ import type {
   MeshSendResult,
   MeshBroadcastResult,
   MeshDiscoverResult,
-} from "./types";
-import type { MeshProtocols } from "./protocols";
+} from "./types.js";
+import type { MeshProtocols } from "./protocols.js";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
 
@@ -225,12 +231,13 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
       onUpdate?.({
         content: [{ type: "text", text: `Dialing peer ${params.peerId}…` }],
+        details: {},
       });
 
       try {
         const MAX_ATTEMPTS = 2;
         const RETRY_DELAY_MS = 500;
-        let response: import("./types").AgentResponse;
+        let response: import("./types.js").AgentResponse;
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           try {
@@ -248,6 +255,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             if (onUpdate) {
               onUpdate({
                 content: [{ type: "text", text: `Retry ${attempt}/${MAX_ATTEMPTS} after dial failure…` }],
+                details: {},
               });
             }
             await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
@@ -259,6 +267,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
         onUpdate?.({
           content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
+          details: {},
         });
 
         const result: MeshSendResult = {
@@ -266,8 +275,6 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           agentName: finalResponse.fromAgent,
           response: finalResponse,
         };
-
-        const peer = store.peers.get(params.peerId);
         return {
           content: [
             {
@@ -332,13 +339,15 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
       onUpdate?.({
         content: [{ type: "text", text: "Broadcasting to all peers…" }],
+        details: {},
       });
 
       try {
+        const msgType = params.type as "announce" | "query" | "response" | "event" | undefined;
         const result = await meshProtocols.broadcast({
           fromAgent: store.agentName,
           message: params.message,
-          type: params.type,
+          type: msgType,
         });
 
         // Record in history (capped at MAX_BROADCAST_HISTORY)
@@ -347,7 +356,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           fromPeerId: "self",
           timestamp: Date.now(),
           message: params.message,
-          type: params.type,
+          type: msgType,
         });
 
         return {
@@ -394,9 +403,10 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     async execute(_toolCallId, _params, _signal, onUpdate) {
       onUpdate?.({
         content: [{ type: "text", text: "Scanning network for new peers…" }],
+        details: {},
       });
 
-      const { peers, total } = listPeers(store);
+      const { peers } = listPeers(store);
       const newPeers = peers.filter(
         (p) => Date.now() - p.discoveredAt < 10_000,
       );
@@ -408,6 +418,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             text: `Found ${peers.length} known peer(s), ${newPeers.length} recently discovered.`,
           },
         ],
+        details: {},
       });
 
       const result: MeshDiscoverResult = {

@@ -1,12 +1,67 @@
 {
   "name": "@earendil-works/pi-libp2p-mesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "P2P mesh network extension for pi agents built on libp2p — peer discovery, direct messaging, and gossip broadcast.",
-  "keywords": ["pi-package", "p2p", "libp2p", "mesh", "gossip"],
+  "keywords": [
+    "pi-package",
+    "p2p",
+    "libp2p",
+    "mesh",
+    "gossip"
+  ],
   "license": "MIT",
   "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./node": {
+      "import": "./dist/node.js",
+      "types": "./dist/node.d.ts"
+    },
+    "./protocols": {
+      "import": "./dist/protocols.js",
+      "types": "./dist/protocols.d.ts"
+    },
+    "./types": {
+      "import": "./dist/types.js",
+      "types": "./dist/types.d.ts"
+    },
+    "./tools": {
+      "import": "./dist/tools.js",
+      "types": "./dist/tools.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "test": "npx tsx test-network.mjs",
+    "test:rigorous": "npx tsx rigorous-concurrent-test.mjs",
+    "test:extension": "npx tsx test-extension.mjs",
+    "test:fifo": "node test-fifo-queue.mjs",
+    "test:identity": "npx tsx test-identity.mjs",
+    "test:leak": "node test-leak.mjs",
+    "test:negative": "npx tsx test-negative.mjs",
+    "test:all": "npm run test:extension && npm run test:fifo && npm run test:leak && npm run test:identity && npm run test:negative && npm run test",
+    "pretest": "npm run build"
+  },
   "pi": {
-    "extensions": ["./src/index.ts"],
+    "extensions": [
+      "./dist/index.js"
+    ],
     "image": "https://raw.githubusercontent.com/libp2p/js-libp2p/main/img/libp2p-logo.png"
   },
   "dependencies": {
@@ -17,7 +72,7 @@
     "@libp2p/crypto": "5.1.8",
     "@libp2p/identify": "^3.0.39",
     "@libp2p/interface": "^2.11.0",
-    "@libp2p/kad-dht": "^14.2.15",
+    "@libp2p/kad-dht": "^16.3.0",
     "@libp2p/mdns": "^11.0.47",
     "@libp2p/peer-id": "^5.1.9",
     "@libp2p/tcp": "^10.1.19",
@@ -27,11 +82,28 @@
     "multiformats": "^13.3.2",
     "uuid": "^11.1.0"
   },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  },
   "overrides": {
-    "@multiformats/dns": "1.0.12"
+    "@multiformats/dns": "1.0.13"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earendil-works/pi-libp2p-mesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/earendil-works/pi-libp2p-mesh/issues"
+  },
+  "homepage": "https://github.com/earendil-works/pi-libp2p-mesh#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
