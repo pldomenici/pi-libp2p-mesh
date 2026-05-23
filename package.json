@@ -39,6 +39,7 @@
   "files": [
     "dist/",
     "src/",
+    "index.ts",
     "README.md",
     "LICENSE",
     "tsconfig.json"
@@ -60,7 +61,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./index.ts"
     ],
     "image": "https://raw.githubusercontent.com/libp2p/js-libp2p/main/img/libp2p-logo.png"
   },
