@@ -37,6 +37,9 @@ let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
+/** Guard to prevent db:updated broadcast loops. */
+let _suppressDbNotify = false;
+
 // Placeholder — the real store is created in session_start after DB is opened
 let store: MeshStore;
 const _sentinelDb = null as unknown as MeshDatabase;
@@ -63,6 +66,80 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
   };
 }
 
+// ── DB Notification ──────────────────────────────────────────────────────────
+
+/**
+ * Broadcast a compact "db:updated" notification so peers know which table
+ * changed and can re-read from the shared-memory DB without re-requesting
+ * all data over the wire.
+ */
+async function notifyDbChanged(
+  table: "peers" | "broadcasts" | "messages" | "kv",
+  affectedPeerId?: string,
+) {
+  if (_suppressDbNotify || !meshProtocols) return;
+  _suppressDbNotify = true;
+  try {
+    await meshProtocols.broadcast({
+      fromAgent: store.agentName,
+      message: `db:updated:${table}${affectedPeerId ? `:${affectedPeerId.slice(0, 12)}` : ""}`,
+      type: "db:updated",
+      table,
+      affectedPeerId,
+    } as any);
+  } catch {
+    // Best-effort — don't block on notification failure
+  } finally {
+    _suppressDbNotify = false;
+  }
+}
+
+/**
+ * Read the updated table from the shared DB when a `db:updated` broadcast
+ * is received, and format a human-readable summary for the LLM.
+ */
+function buildDbUpdatedMessage(msg: import("./types.js").BroadcastMessage): string {
+  const table = msg.table!;
+  const affectedPeerId = msg.affectedPeerId;
+
+  switch (table) {
+    case "peers": {
+      if (affectedPeerId) {
+        const peer = store.db.getPeer(affectedPeerId);
+        if (peer) {
+          const icon = peer.status === "connected" ? "🟢" : "🔴";
+          return `[DB update: ${msg.fromAgent} wrote to peers table]\n${icon} **${peer.agentName ?? "unknown"}** (${peer.id}) — ${peer.status}\nAddresses: ${peer.addresses.join(", ") || "none"}`;
+        }
+      }
+      // Full peer table summary
+      const all = store.db.getAllPeers();
+      const connected = all.filter(p => p.status === "connected").length;
+      return `[DB update: ${msg.fromAgent} wrote to peers table]\n${connected}/${all.length} peers in DB: ${all.map(p => (p.status === "connected" ? "🟢" : "🔴") + " " + (p.agentName ?? "unknown")).join(", ")}`;
+    }
+
+    case "broadcasts": {
+      const recent = store.db.getBroadcasts(5);
+      if (recent.length === 0) return `[DB update: ${msg.fromAgent} wrote to broadcasts table]\nNo broadcasts in history.`;
+      return `[DB update: ${msg.fromAgent} wrote to broadcasts table]\nLast ${recent.length} broadcasts:\n${recent.map(b => `  • ${b.fromAgent}: "${b.message.slice(0, 80)}…"`).join("\n")}`;
+    }
+
+    case "messages": {
+      const recent = store.db.getMessages(5);
+      if (recent.length === 0) return `[DB update: ${msg.fromAgent} wrote to messages table]\nNo messages in history.`;
+      return `[DB update: ${msg.fromAgent} wrote to messages table]\nLast ${recent.length} messages:\n${recent.map(m => `  • ${m.direction} ${m.from_agent}: "${m.message.slice(0, 80)}…"`).join("\n")}`;
+    }
+
+    case "kv": {
+      const keys = ["agent_name", "last_saved"];
+      const vals = keys.map(k => `${k}=${store.db.getKV(k) ?? "?"}`).join(", ");
+      return `[DB update: ${msg.fromAgent} wrote to kv table]\nKV: ${vals}`;
+    }
+
+    default:
+      return `[DB update: ${msg.fromAgent} wrote to ${table}]`;
+  }
+}
+
 // ── Event Handler ────────────────────────────────────────────────────────────
 
 function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
@@ -81,6 +158,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         store.db.upsertPeer(ev.peer);
       }
       if (meshProtocols) meshProtocols.handlePeerDiscovered(ev.peer);
+      notifyDbChanged("peers", ev.peer.id);
       notify(pi, `Peer discovered: ${ev.peer.id} (${ev.peer.addresses.join(", ")})`);
       break;
     }
@@ -99,6 +177,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       p.status = "connected";
       p.disconnectedAt = undefined;
       store.db.upsertPeer(p);
+      notifyDbChanged("peers", ev.peerId);
       notify(pi, `Peer connected: ${ev.peerId}`);
       break;
     }
@@ -109,6 +188,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         p.status = "disconnected";
         p.disconnectedAt = Date.now();
         store.db.upsertPeer(p);
+        notifyDbChanged("peers", ev.peerId);
       }
       notify(pi, `Peer disconnected: ${ev.peerId}`);
       break;
@@ -128,6 +208,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       if (ev.agentName) {
         p.agentName = ev.agentName;
         store.db.upsertPeer(p);
+        notifyDbChanged("peers", ev.peerId);
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
       }
       break;
@@ -142,11 +223,14 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         fromAgent: ev.request.fromAgent,
         message: ev.request.message,
       });
+      notifyDbChanged("messages", ev.request.fromPeerId);
       notify(pi, `Message from ${ev.request.fromAgent}: ${ev.request.message.slice(0, 120)}`);
       break;
 
     case "broadcast":
       recordBroadcast(store, ev.message);
+      // Don't re-notify for broadcasts — that would create an infinite loop.
+      // The onBroadcast handler below handles db:updated notifications.
       notify(pi, `Broadcast from ${ev.message.fromAgent}: ${ev.message.message.slice(0, 120)}`);
       break;
 
@@ -194,6 +278,14 @@ export default async function (pi: ExtensionAPI) {
     const db = new MeshDatabase(dbPath, agentName);
     store = { db, agentName, autoReplyAll: false };
 
+    // Mark peers from previous sessions as disconnected.
+    // Without this, restarted agents with new PeerIds leave stale
+    // "connected" entries in the DB forever.
+    const disconnected = db.disconnectPeersFromOtherSessions();
+    if (disconnected > 0) {
+      notify(pi, `Marked ${disconnected} peer(s) from previous sessions as disconnected`);
+    }
+
     const config = buildConfig(pi);
 
     try {
@@ -203,16 +295,9 @@ export default async function (pi: ExtensionAPI) {
       // Wire protocols into tools so mesh_send / mesh_broadcast work
       setMeshProtocols(meshProtocols);
 
-      // Incoming direct messages — forward via pi's event bus
+      // Incoming direct messages — forward via pi's event bus.
+      // Logging is handled in handleNodeEvent (single source of truth).
       meshProtocols.onMessage = (_peerId, request) => {
-        // Log incoming message to DB
-        store.db.logMessage({
-          direction: "incoming",
-          peerId: request.fromPeerId,
-          requestId: request.requestId,
-          fromAgent: request.fromAgent,
-          message: request.message,
-        });
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
       };
 
@@ -319,6 +404,18 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming broadcasts — record in store, notify, and optionally forward to LLM
       meshProtocols.onBroadcast = (msg) => {
+        // db:updated — a peer wrote to the shared DB. Read the updated table
+        // and notify the LLM without re-broadcasting (avoids infinite loop).
+        if (msg.type === "db:updated" && msg.table) {
+          if (!store.autoReplyAll) {
+            pi.sendUserMessage(
+              buildDbUpdatedMessage(msg),
+              { deliverAs: "steer" },
+            );
+          }
+          return; // Don't record as a broadcast — prevents loops
+        }
+
         handleNodeEvent(pi, { type: "broadcast", message: msg });
 
         // If auto-reply-all is off, forward the broadcast to the LLM so the agent

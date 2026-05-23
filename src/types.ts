@@ -79,7 +79,14 @@ export interface BroadcastMessage {
   /** Message body */
   message: string;
   /** Optional message type hint */
-  type?: "announce" | "query" | "response" | "event";
+  type?: "announce" | "query" | "response" | "event" | "db:updated";
+  /**
+   * For `db:updated` broadcasts only: which DB table changed, so peers
+   * can efficiently re-query just the relevant table from shared memory.
+   */
+  table?: "peers" | "broadcasts" | "messages" | "kv";
+  /** For `db:updated` broadcasts: the PeerId of the affected peer (if applicable). */
+  affectedPeerId?: string;
 }
 
 // ── Node Config ─────────────────────────────────────────────────────────────

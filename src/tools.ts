@@ -216,6 +216,17 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         const finalResponse = response!;
 
+        // Log outgoing message + response to DB
+        store.db.logMessage({
+          direction: "outgoing",
+          peerId: params.peerId,
+          requestId: finalResponse.requestId,
+          fromAgent: finalResponse.fromAgent,
+          message: params.message,
+          response: finalResponse.message,
+          error: finalResponse.error,
+        });
+
         onUpdate?.({
           content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
           details: {},
@@ -237,6 +248,16 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           details: result,
         };
       } catch (err: any) {
+        // Log failed outgoing attempt to DB
+        store.db.logMessage({
+          direction: "outgoing",
+          peerId: params.peerId,
+          fromAgent: store.agentName,
+          message: params.message,
+          response: `[failed] ${err.message}`,
+          error: true,
+        });
+
         const result: MeshSendResult = {
           peerId: params.peerId,
           response: null,
@@ -301,7 +322,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           type: msgType,
         });
 
-        // Record in history (capped at MAX_BROADCAST_HISTORY)
+        // Record in DB (cap eviction handled by db.recordBroadcast)
         recordBroadcast(store, {
           fromAgent: store.agentName,
           fromPeerId: "self",

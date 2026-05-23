@@ -122,6 +122,7 @@ export class MeshDatabase {
   private stmtPruneStale!: Database.Statement;
   private stmtPruneAllDisconnected!: Database.Statement;
   private stmtPruneDedupByName!: Database.Statement;
+  private stmtDisconnectOtherSessions!: Database.Statement;
 
   // Broadcasts
   private stmtInsertBroadcast!: Database.Statement;
@@ -161,7 +162,7 @@ export class MeshDatabase {
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("cache_size = -4000");
-    this.db.pragma("mmap_size = 268435456");
+    this.db.pragma("mmap_size = 536870912");
 
     // Create schema
     this.db.exec(SCHEMA);
@@ -245,6 +246,17 @@ export class MeshDatabase {
    */
   pruneDedupByName(): number {
     const info = this.stmtPruneDedupByName.run();
+    return info.changes;
+  }
+
+  /**
+   * Mark all connected peers from previous sessions as disconnected.
+   * Called on session_start so stale "connected" entries from old sessions
+   * don't persist across restarts.
+   * Returns the number of peers marked disconnected.
+   */
+  disconnectPeersFromOtherSessions(): number {
+    const info = this.stmtDisconnectOtherSessions.run(Date.now(), this.sessionId);
     return info.changes;
   }
 
@@ -347,7 +359,9 @@ export class MeshDatabase {
     try {
       this.db.pragma("wal_checkpoint(TRUNCATE)");
     } catch {
-      // Best-effort
+      // SQLITE_BUSY — another process is reading the WAL. Data is safe;
+      // WAL will auto-checkpoint on next write. Log for visibility.
+      console.warn("[MeshDatabase] wal_checkpoint(TRUNCATE) failed — WAL file may persist until next write");
     }
   }
 
@@ -397,6 +411,13 @@ export class MeshDatabase {
         AND agent_name IN (
           SELECT agent_name FROM peers WHERE status = 'connected' AND agent_name IS NOT NULL
         )
+    `);
+
+    // Disconnect peers from other sessions (mark stale connected peers as disconnected)
+    this.stmtDisconnectOtherSessions = this.db.prepare(/* sql */ `
+      UPDATE peers
+      SET status = 'disconnected', disconnected_at = ?
+      WHERE status = 'connected' AND session_id != ?
     `);
 
     // Broadcasts
@@ -454,6 +475,11 @@ interface RowPeer {
 }
 
 function rowToPeer(row: RowPeer): MeshPeer {
+  // Runtime guard: catches schema drift (renamed/dropped column) early
+  if (typeof row.id !== "string") throw new Error("MeshDatabase: peers.id is not a string — schema drift?");
+  if (typeof row.status !== "string") throw new Error("MeshDatabase: peers.status is not a string — schema drift?");
+  if (typeof row.discovered_at !== "number") throw new Error("MeshDatabase: peers.discovered_at is not a number — schema drift?");
+
   return {
     id: row.id,
     addresses: safeJsonParse<string[]>(row.addresses, []),
@@ -473,6 +499,9 @@ interface RowBroadcast {
 }
 
 function rowToBroadcast(row: RowBroadcast): BroadcastMessage {
+  if (typeof row.from_agent !== "string") throw new Error("MeshDatabase: broadcasts.from_agent is not a string — schema drift?");
+  if (typeof row.timestamp !== "number") throw new Error("MeshDatabase: broadcasts.timestamp is not a number — schema drift?");
+
   return {
     fromAgent: row.from_agent,
     fromPeerId: row.from_peer_id,
