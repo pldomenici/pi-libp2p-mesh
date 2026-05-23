@@ -83,6 +83,7 @@ export interface BroadcastMessage {
   /**
    * For `db:updated` broadcasts only: which DB table changed, so peers
    * can efficiently re-query just the relevant table from shared memory.
+   * Only meaningful when `type === "db:updated"`.
    */
   table?: "peers" | "broadcasts" | "messages" | "kv";
   /** For `db:updated` broadcasts: the PeerId of the affected peer (if applicable). */

@@ -26,7 +26,6 @@ import type {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
-/**
  * Read the entirety of a libp2p {@link Stream} into a single `Uint8Array`,
  * respecting an optional {@link AbortSignal} to prevent indefinite hangs.
  *
@@ -442,7 +441,6 @@ export class MeshProtocols {
     this._onBroadcast?.(broadcastMsg);
   }
 
-  /**
   /**
    * Resolve the GossipSub pubsub instance from wherever it is mounted
    * on the libp2p node.

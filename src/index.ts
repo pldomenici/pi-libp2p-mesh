@@ -41,11 +41,8 @@ let pruneInterval: ReturnType<typeof setInterval> | null = null;
 let _suppressDbNotify = false;
 
 // Placeholder — the real store is created in session_start after DB is opened
-let store: MeshStore;
-const _sentinelDb = null as unknown as MeshDatabase;
-// Sentinel store until real one is created in session_start
-store = {
-  db: _sentinelDb,
+let store: MeshStore = {
+  db: null as unknown as MeshDatabase,
   agentName: "",
   autoReplyAll: false,
 };
@@ -86,7 +83,7 @@ async function notifyDbChanged(
       type: "db:updated",
       table,
       affectedPeerId,
-    } as any);
+    } satisfies Omit<import("./types.js").BroadcastMessage, "fromPeerId" | "timestamp">);
   } catch {
     // Best-effort — don't block on notification failure
   } finally {
