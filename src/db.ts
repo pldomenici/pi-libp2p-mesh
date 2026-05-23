@@ -22,6 +22,7 @@ import fs from "node:fs";
 
 import type {
   MeshPeer,
+  MeshMemory,
   BroadcastMessage,
 } from "./types.js";
 
@@ -84,6 +85,25 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_peer_id ON messages(peer_id);
 
+-- Memories: structured, queryable agent memory about peers and topics
+CREATE TABLE IF NOT EXISTS memories (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  peer_id     TEXT,                       -- which peer this is about (NULL for general)
+  agent_name  TEXT,                       -- which agent this is about
+  key         TEXT NOT NULL,              -- semantic key/topic
+  value       TEXT NOT NULL,              -- memory content
+  tags        TEXT NOT NULL DEFAULT '[]', -- JSON array of tag strings
+  importance  INTEGER NOT NULL DEFAULT 1, -- 1-5 scale
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  session_id  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_peer_id ON memories(peer_id);
+CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+CREATE INDEX IF NOT EXISTS idx_memories_agent_name ON memories(agent_name);
+CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+
 -- KV store for config values and runtime metadata
 CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,
@@ -133,6 +153,19 @@ export class MeshDatabase {
   // Messages
   private stmtInsertMessage!: Database.Statement;
   private stmtGetMessages!: Database.Statement;
+
+  // Memories
+  private stmtStoreMemory!: Database.Statement;
+  private stmtGetMemory!: Database.Statement;
+  private stmtRecallByPeer!: Database.Statement;
+  private stmtRecallByKey!: Database.Statement;
+  private stmtRecallByAgent!: Database.Statement;
+  private stmtSearchMemories!: Database.Statement;
+  private stmtForgetMemory!: Database.Statement;
+  private stmtForgetByKey!: Database.Statement;
+  private stmtUpdateMemory!: Database.Statement;
+  private stmtGetAllMemories!: Database.Statement;
+  private stmtGetMemoriesCount!: Database.Statement;
 
   // KV
   private stmtGetKv!: Database.Statement;
@@ -325,6 +358,129 @@ export class MeshDatabase {
     return this.stmtGetMessages.all(limit) as RowMessage[];
   }
 
+  // ── Memories ─────────────────────────────────────────────────────────────
+
+  /**
+   * Store a new memory, or update an existing one by (peer_id, agent_name, key).
+   * Returns the stored {@link MeshMemory} with the assigned ID.
+   */
+  storeMemory(memory: Omit<MeshMemory, "id" | "createdAt" | "updatedAt"> & { id?: number }): MeshMemory {
+    const now = Date.now();
+    const tags = JSON.stringify(memory.tags);
+
+    if (memory.id != null) {
+      // Update existing memory by ID
+      this.stmtUpdateMemory.run(
+        memory.key,
+        memory.value,
+        tags,
+        memory.importance,
+        now,
+        memory.id,
+      );
+      return { ...memory, id: memory.id, createdAt: now, updatedAt: now } as MeshMemory;
+    }
+
+    const info = this.stmtStoreMemory.run(
+      memory.peerId ?? null,
+      memory.agentName ?? null,
+      memory.key,
+      memory.value,
+      tags,
+      memory.importance,
+      now,
+      now,
+      this.sessionId,
+    );
+
+    return {
+      id: Number(info.lastInsertRowid),
+      peerId: memory.peerId,
+      agentName: memory.agentName,
+      key: memory.key,
+      value: memory.value,
+      tags: memory.tags,
+      importance: memory.importance,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Retrieve a single memory by its numeric ID.
+   */
+  getMemory(id: number): MeshMemory | undefined {
+    const row = this.stmtGetMemory.get(id) as RowMemory | undefined;
+    return row ? rowToMemory(row) : undefined;
+  }
+
+  /**
+   * Recall all memories about a specific peer (by PeerId).
+   */
+  recallByPeer(peerId: string): MeshMemory[] {
+    const rows = this.stmtRecallByPeer.all(peerId) as RowMemory[];
+    return rows.map(rowToMemory);
+  }
+
+  /**
+   * Recall memories by semantic key/topic (exact match).
+   */
+  recallByKey(key: string): MeshMemory[] {
+    const rows = this.stmtRecallByKey.all(key) as RowMemory[];
+    return rows.map(rowToMemory);
+  }
+
+  /**
+   * Recall memories about a specific agent (by name).
+   */
+  recallByAgent(agentName: string): MeshMemory[] {
+    const rows = this.stmtRecallByAgent.all(agentName) as RowMemory[];
+    return rows.map(rowToMemory);
+  }
+
+  /**
+   * Full-text search across memory key and value fields (LIKE-based).
+   */
+  searchMemories(query: string, limit: number = 20): MeshMemory[] {
+    const pattern = `%${query}%`;
+    const rows = this.stmtSearchMemories.all(pattern, pattern, limit) as RowMemory[];
+    return rows.map(rowToMemory);
+  }
+
+  /**
+   * Delete a memory by its numeric ID.
+   * Returns true if a row was deleted.
+   */
+  forgetMemory(id: number): boolean {
+    const info = this.stmtForgetMemory.run(id);
+    return info.changes > 0;
+  }
+
+  /**
+   * Delete all memories matching a given key.
+   * Returns the number of deleted rows.
+   */
+  forgetByKey(key: string): number {
+    const info = this.stmtForgetByKey.run(key);
+    return info.changes;
+  }
+
+  /**
+   * Get all memories, most recently updated first.
+   */
+  getAllMemories(limit: number = 100): MeshMemory[] {
+    const rows = this.stmtGetAllMemories.all(limit) as RowMemory[];
+    return rows.map(rowToMemory);
+  }
+
+  /**
+   * Get total memory count.
+   */
+  getMemoriesCount(): number {
+    const row = this.stmtGetMemoriesCount.get() as { cnt: number };
+    return row.cnt;
+  }
+
   // ── KV Store ──────────────────────────────────────────────────────────────
 
   getKV(key: string): string | null {
@@ -450,6 +606,63 @@ export class MeshDatabase {
       SELECT * FROM messages ORDER BY timestamp DESC LIMIT ?
     `);
 
+    // Memories
+    this.stmtStoreMemory = this.db.prepare(/* sql */ `
+      INSERT INTO memories (peer_id, agent_name, key, value, tags, importance, created_at, updated_at, session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.stmtUpdateMemory = this.db.prepare(/* sql */ `
+      UPDATE memories
+      SET key = ?, value = ?, tags = ?, importance = ?, updated_at = ?
+      WHERE id = ?
+    `);
+
+    this.stmtGetMemory = this.db.prepare(/* sql */ `
+      SELECT * FROM memories WHERE id = ?
+    `);
+
+    this.stmtRecallByPeer = this.db.prepare(/* sql */ `
+      SELECT * FROM memories
+      WHERE peer_id = ?
+      ORDER BY importance DESC, updated_at DESC
+    `);
+
+    this.stmtRecallByKey = this.db.prepare(/* sql */ `
+      SELECT * FROM memories
+      WHERE key = ?
+      ORDER BY importance DESC, updated_at DESC
+    `);
+
+    this.stmtRecallByAgent = this.db.prepare(/* sql */ `
+      SELECT * FROM memories
+      WHERE agent_name = ?
+      ORDER BY importance DESC, updated_at DESC
+    `);
+
+    this.stmtSearchMemories = this.db.prepare(/* sql */ `
+      SELECT * FROM memories
+      WHERE key LIKE ? OR value LIKE ?
+      ORDER BY importance DESC, updated_at DESC
+      LIMIT ?
+    `);
+
+    this.stmtForgetMemory = this.db.prepare(/* sql */ `
+      DELETE FROM memories WHERE id = ?
+    `);
+
+    this.stmtForgetByKey = this.db.prepare(/* sql */ `
+      DELETE FROM memories WHERE key = ?
+    `);
+
+    this.stmtGetAllMemories = this.db.prepare(/* sql */ `
+      SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?
+    `);
+
+    this.stmtGetMemoriesCount = this.db.prepare(/* sql */ `
+      SELECT COUNT(*) AS cnt FROM memories
+    `);
+
     // KV
     this.stmtGetKv = this.db.prepare(/* sql */ `
       SELECT value FROM kv WHERE key = ?
@@ -508,6 +721,37 @@ function rowToBroadcast(row: RowBroadcast): BroadcastMessage {
     timestamp: row.timestamp,
     message: row.message,
     type: (row.type as BroadcastMessage["type"]) ?? undefined,
+  };
+}
+
+interface RowMemory {
+  id: number;
+  peer_id: string | null;
+  agent_name: string | null;
+  key: string;
+  value: string;
+  tags: string;
+  importance: number;
+  created_at: number;
+  updated_at: number;
+  session_id: string;
+}
+
+function rowToMemory(row: RowMemory): MeshMemory {
+  if (typeof row.id !== "number") throw new Error("MeshDatabase: memories.id is not a number — schema drift?");
+  if (typeof row.key !== "string") throw new Error("MeshDatabase: memories.key is not a string — schema drift?");
+  if (typeof row.importance !== "number") throw new Error("MeshDatabase: memories.importance is not a number — schema drift?");
+
+  return {
+    id: row.id,
+    peerId: row.peer_id ?? undefined,
+    agentName: row.agent_name ?? undefined,
+    key: row.key,
+    value: row.value,
+    tags: safeJsonParse<string[]>(row.tags, []),
+    importance: row.importance,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
