@@ -26,6 +26,7 @@ import type { MeshConfig, MeshNodeEvent } from "./types.js";
 import { MeshNode } from "./node.js";
 import { MeshProtocols } from "./protocols.js";
 import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
+import { MeshDatabase, DEFAULT_DB_PATH } from "./db.js";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -36,11 +37,14 @@ let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
-const store: MeshStore = {
-  peers: new Map(),
-  broadcastHistory: [],
-  agentName: "", // set during extension init after flag is read
-  autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
+// Placeholder — the real store is created in session_start after DB is opened
+let store: MeshStore;
+const _sentinelDb = null as unknown as MeshDatabase;
+// Sentinel store until real one is created in session_start
+store = {
+  db: _sentinelDb,
+  agentName: "",
+  autoReplyAll: false,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -64,7 +68,7 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
 function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
   switch (ev.type) {
     case "peer:discovered": {
-      const existing = store.peers.get(ev.peer.id);
+      const existing = store.db.getPeer(ev.peer.id);
       if (existing) {
         // Merge addresses (discovery may fire after connect/identify)
         const existingAddrs = new Set(existing.addresses);
@@ -72,8 +76,9 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         existing.addresses = [...existingAddrs];
         // Don't downgrade from connected to disconnected if we already have an active connection
         existing.discoveredAt = ev.peer.discoveredAt;
+        store.db.upsertPeer(existing);
       } else {
-        store.peers.set(ev.peer.id, ev.peer);
+        store.db.upsertPeer(ev.peer);
       }
       if (meshProtocols) meshProtocols.handlePeerDiscovered(ev.peer);
       notify(pi, `Peer discovered: ${ev.peer.id} (${ev.peer.addresses.join(", ")})`);
@@ -81,7 +86,7 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
     }
 
     case "peer:connected": {
-      let p = store.peers.get(ev.peerId);
+      let p = store.db.getPeer(ev.peerId);
       if (!p) {
         // Inbound connection before mDNS discovery — create a placeholder
         p = {
@@ -90,23 +95,27 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
           status: "connected",
           discoveredAt: Date.now(),
         };
-        store.peers.set(ev.peerId, p);
-      } else {
-        p.status = "connected";
       }
+      p.status = "connected";
+      p.disconnectedAt = undefined;
+      store.db.upsertPeer(p);
       notify(pi, `Peer connected: ${ev.peerId}`);
       break;
     }
 
     case "peer:disconnected": {
-      const p = store.peers.get(ev.peerId);
-      if (p) { p.status = "disconnected"; p.disconnectedAt = Date.now(); }
+      const p = store.db.getPeer(ev.peerId);
+      if (p) {
+        p.status = "disconnected";
+        p.disconnectedAt = Date.now();
+        store.db.upsertPeer(p);
+      }
       notify(pi, `Peer disconnected: ${ev.peerId}`);
       break;
     }
 
     case "peer:identified": {
-      let p = store.peers.get(ev.peerId);
+      let p = store.db.getPeer(ev.peerId);
       if (!p) {
         // Identify before discovery — create a placeholder
         p = {
@@ -115,18 +124,24 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
           status: "connected",
           discoveredAt: Date.now(),
         };
-        store.peers.set(ev.peerId, p);
       }
       if (ev.agentName) {
         p.agentName = ev.agentName;
+        store.db.upsertPeer(p);
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
       }
       break;
     }
 
     case "message":
-      // Incoming direct message — could forward to LLM via pi.sendMessage
-      // For now we log; the LLM accesses via tools.
+      // Log incoming message to DB
+      store.db.logMessage({
+        direction: "incoming",
+        peerId: ev.request.fromPeerId,
+        requestId: ev.request.requestId,
+        fromAgent: ev.request.fromAgent,
+        message: ev.request.message,
+      });
       notify(pi, `Message from ${ev.request.fromAgent}: ${ev.request.message.slice(0, 120)}`);
       break;
 
@@ -158,6 +173,11 @@ export default async function (pi: ExtensionAPI) {
     type: "string",
     default: "pi-broadcast",
   });
+  pi.registerFlag("mesh-db-path", {
+    description: `Path to the SQLite database file (default: ${DEFAULT_DB_PATH})`,
+    type: "string",
+    default: "",
+  });
 
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
@@ -167,7 +187,12 @@ export default async function (pi: ExtensionAPI) {
     //   3. Default: pi-<hostname>
     const flagName = pi.getFlag("agent-name") as string;
     const envName = process.env.PI_MESH_NAME || process.env.PI_COMM_NAME;
-    store.agentName = flagName || envName || `pi-${hostname}`;
+    const agentName = flagName || envName || `pi-${hostname}`;
+
+    // ── Open SQLite database (WAL mode, shared memory) ────────────────────
+    const dbPath = (pi.getFlag("mesh-db-path") as string) || DEFAULT_DB_PATH;
+    const db = new MeshDatabase(dbPath, agentName);
+    store = { db, agentName, autoReplyAll: false };
 
     const config = buildConfig(pi);
 
@@ -180,6 +205,14 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming direct messages — forward via pi's event bus
       meshProtocols.onMessage = (_peerId, request) => {
+        // Log incoming message to DB
+        store.db.logMessage({
+          direction: "incoming",
+          peerId: request.fromPeerId,
+          requestId: request.requestId,
+          fromAgent: request.fromAgent,
+          message: request.message,
+        });
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
       };
 
@@ -340,6 +373,13 @@ export default async function (pi: ExtensionAPI) {
     meshNode = null;
     meshProtocols = null;
     setMeshProtocols(null);
+
+    // WAL checkpoint + close database
+    if (store.db) {
+      store.db.checkpoint();
+      store.db.close();
+    }
+
     notify(pi, "Mesh node stopped");
   });
 
@@ -447,9 +487,9 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const before = store.peers.size;
+      const before = store.db.getAllPeers().length;
       const removed = pruneAllDisconnected(store);
-      const after = store.peers.size;
+      const after = store.db.getAllPeers().length;
       // After pruning all disconnected, remaining peers are connected
       const connected = after;
 

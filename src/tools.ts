@@ -26,33 +26,29 @@ import type {
   MeshDiscoverResult,
 } from "./types.js";
 import type { MeshProtocols } from "./protocols.js";
+import type { MeshDatabase } from "./db.js";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
 
 /**
  * Mutable store shared between the extension entry point and tools.
  * Populated in index.ts, consumed here.
+ *
+ * Peer and broadcast data is persisted to SQLite via {@link db}.
  */
 export interface MeshStore {
-  peers: Map<string, MeshPeer>;
-  broadcastHistory: BroadcastMessage[];
+  db: MeshDatabase;
   agentName: string;
   /** When true, all incoming messages auto-reply without involving the LLM. */
   autoReplyAll: boolean;
 }
 
-/** M3: Maximum number of broadcast entries to retain before evicting oldest. */
-export const MAX_BROADCAST_HISTORY = 200;
-
 /**
- * Push a broadcast onto the store's history, evicting the oldest entry if
- * the cap is exceeded (prevents unbounded memory growth).
+ * Push a broadcast onto the store's database-backed history,
+ * evicting the oldest entry if the cap is exceeded.
  */
 export function recordBroadcast(store: MeshStore, msg: BroadcastMessage): void {
-  store.broadcastHistory.push(msg);
-  while (store.broadcastHistory.length > MAX_BROADCAST_HISTORY) {
-    store.broadcastHistory.shift();
-  }
+  store.db.recordBroadcast(msg);
 }
 
 /** Module-level reference — set by index.ts after session_start. */
@@ -79,45 +75,7 @@ const STALE_PEER_MS = 60 * 1000;
  * Returns the number of removed entries.
  */
 export function pruneStalePeers(store: MeshStore): number {
-  const now = Date.now();
-  let removed = 0;
-
-  // Strategy 1: agent-name dedup — same name, keep connected, remove disconnected
-  const byName = new Map<string, MeshPeer[]>();
-  for (const [, peer] of store.peers) {
-    if (peer.agentName) {
-      const entries = byName.get(peer.agentName) ?? [];
-      entries.push(peer);
-      byName.set(peer.agentName, entries);
-    }
-  }
-  for (const [, entries] of byName) {
-    if (entries.length > 1) {
-      const connected = entries.filter((p) => p.status === "connected");
-      if (connected.length > 0) {
-        // Keep connected entry, remove disconnected ones with same name
-        for (const entry of entries) {
-          if (entry.status === "disconnected") {
-            store.peers.delete(entry.id);
-            removed++;
-          }
-        }
-      }
-    }
-  }
-
-  // Strategy 2: time-based cleanup
-  for (const [id, peer] of store.peers) {
-    if (peer.status === "disconnected") {
-      const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
-      if (now - lastSeen > STALE_PEER_MS) {
-        store.peers.delete(id);
-        removed++;
-      }
-    }
-  }
-
-  return removed;
+  return store.db.pruneDedupByName() + store.db.pruneStale(STALE_PEER_MS);
 }
 
 /**
@@ -125,14 +83,7 @@ export function pruneStalePeers(store: MeshStore): number {
  * Returns count of removed entries.
  */
 export function pruneAllDisconnected(store: MeshStore): number {
-  let removed = 0;
-  for (const [id, peer] of store.peers) {
-    if (peer.status === "disconnected") {
-      store.peers.delete(id);
-      removed++;
-    }
-  }
-  return removed;
+  return store.db.pruneAllDisconnected();
 }
 
 export interface PeerListResult {
@@ -144,7 +95,7 @@ export interface PeerListResult {
 /** Get current peer list after pruning stale entries. */
 export function listPeers(store: MeshStore): PeerListResult {
   pruneStalePeers(store);
-  const peers = [...store.peers.values()];
+  const peers = store.db.getAllPeers();
   const connected = peers.filter((p) => p.status === "connected").length;
   return { peers, connected, total: peers.length };
 }
@@ -459,9 +410,9 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     parameters: Type.Object({}),
 
     async execute() {
-      const before = store.peers.size;
+      const before = store.db.getAllPeers().length;
       const removed = pruneAllDisconnected(store);
-      const after = store.peers.size;
+      const after = store.db.getAllPeers().length;
       const { connected } = listPeers(store);
 
       const text =
