@@ -11,7 +11,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { Libp2p, Stream, PubSub } from '@libp2p/interface';
+import type { Libp2p, Stream } from '@libp2p/interface';
 import type { GossipsubMessage } from '@chainsafe/libp2p-gossipsub';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import type {
@@ -45,7 +45,8 @@ async function readStream(
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
 
-  for await (const raw of stream.source) {
+  // Stream is AsyncIterable<Uint8Array | Uint8ArrayList> in v3
+  for await (const raw of stream) {
     // Check for abort between chunks (prevents indefinite hang on
     // a stream that trickles data but never closes).
     if (signal?.aborted) {
@@ -135,7 +136,7 @@ export class MeshProtocols {
 
     // 1. Register the direct-messaging protocol handler
     libp2p
-      .handle(this.protocol, ({ stream, connection }) => {
+      .handle(this.protocol, (stream, connection) => {
         this.handleIncomingMessage(
           stream,
           connection.remotePeer.toString(),
@@ -241,16 +242,9 @@ export class MeshProtocols {
         signal: abortController.signal,
       });
 
-      // Write the request to the stream
-      // (signal is passed via the abort controller on the dialProtocol call)
-      await stream.sink(
-        (async function* () {
-          yield encoder.encode(JSON.stringify(fullRequest));
-        })(),
-      );
-
-      // Close the write side to signal end-of-request
-      await stream.closeWrite();
+      // Write the request to the stream (v3: send + close write side)
+      stream.send(encoder.encode(JSON.stringify(fullRequest)));
+      await stream.close({ signal: abortController.signal });
 
       // Read the full response (abort-aware — prevents indefinite hang if the
       // remote peer closes write but never sends data)
@@ -398,12 +392,9 @@ export class MeshProtocols {
         error: false,
       };
 
-      // Write the response back
-      await stream.sink(
-        (async function* () {
-          yield encoder.encode(JSON.stringify(response));
-        })(),
-      );
+      // Write the response back (v3: send + close write side)
+      stream.send(encoder.encode(JSON.stringify(response)));
+      await stream.close();
 
       // Notify the registered callback (for logging/side effects)
       this._onMessage?.(peerIdStr, request);
@@ -422,11 +413,8 @@ export class MeshProtocols {
       };
 
       try {
-        await stream.sink(
-          (async function* () {
-            yield encoder.encode(JSON.stringify(errorResponse));
-          })(),
-        );
+        stream.send(encoder.encode(JSON.stringify(errorResponse)));
+        await stream.close();
       } catch {
         // Best-effort — stream may already be broken
       }
@@ -464,12 +452,12 @@ export class MeshProtocols {
    *
    * @returns The `PubSub` instance, or `null` if not available.
    */
-  private resolvePubsub(): PubSub | null {
+  private resolvePubsub(): any | null {
     const libp2pAny = this.libp2p as unknown as Record<string, unknown>;
     const svc = libp2pAny.services as Record<string, unknown> | undefined;
-    if (svc?.pubsub != null) return svc.pubsub as PubSub;
+    if (svc?.pubsub != null) return svc.pubsub as any;
     if (libp2pAny.pubsub != null) {
-      return libp2pAny.pubsub as PubSub;
+      return libp2pAny.pubsub as any;
     }
     return null;
   }

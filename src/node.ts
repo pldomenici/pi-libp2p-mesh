@@ -131,27 +131,29 @@ export class MeshNode {
       },
       services: {
         identify: identify(),
-        pubsub: gossipsub(),
+        pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }) as any,
       },
     };
 
+    // libp2pConfig is declared as Libp2pOptions — use any for dynamic mutations
+    const cfg = libp2pConfig as any;
+
     // mDNS local discovery
     if (mergedConfig.enableMdns !== false) {
-      libp2pConfig.peerDiscovery = libp2pConfig.peerDiscovery ?? [];
-      libp2pConfig.peerDiscovery.push(mdns());
+      cfg.peerDiscovery = cfg.peerDiscovery ?? [];
+      cfg.peerDiscovery.push(mdns());
     }
 
     // Kademlia DHT for wider-area discovery
     if (mergedConfig.enableDht) {
-      const cfg = libp2pConfig as any;
       cfg.services.dht = kadDHT({
         protocol: "/ipfs/kad/1.0.0",
         peerInfoMapper: removePrivateAddressesMapper,
       });
 
       if (mergedConfig.bootstrapPeers?.length) {
-        libp2pConfig.peerDiscovery = libp2pConfig.peerDiscovery ?? [];
-        libp2pConfig.peerDiscovery.push(
+        cfg.peerDiscovery = cfg.peerDiscovery ?? [];
+        cfg.peerDiscovery.push(
           bootstrap({ list: mergedConfig.bootstrapPeers }),
         );
       }

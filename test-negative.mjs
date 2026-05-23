@@ -102,15 +102,13 @@ async function sendRawBytes(protocols, peerId, bytes) {
   const peerIdObj = peerIdFromString(peerId);
   const stream = await protocols.libp2p.dialProtocol(peerIdObj, ['/pi-agent/0.1.0']);
   try {
-    await stream.sink(
-      (async function* () {
-        yield bytes;
-      })(),
-    );
-    await stream.closeWrite();
+    // v3: send + close write side
+    stream.send(bytes);
+    await stream.close();
     // Read response (may be error response or nothing)
+    // Stream is AsyncIterable in v3
     const chunks = [];
-    for await (const chunk of stream.source) {
+    for await (const chunk of stream) {
       chunks.push(chunk);
     }
     return Buffer.concat(chunks.map(c => c instanceof Uint8Array ? c : c.subarray()));

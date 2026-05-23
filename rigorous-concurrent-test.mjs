@@ -945,14 +945,16 @@ async function phase10_FifoQueue(ctx) {
     passed++;
   } catch (err) { console.log(`      ❌ Stale skip: ${err.message}`); failed++; }
 
-  // 10e: All timed-out, queue drains
+  // 10e: All timed-out entries drain from queue
   try {
     const q = new FifoQueue();
     const p1 = q.send('a', 'stay', 5000);
-    for (let i = 1; i < 5; i++) q.send(`p-${i}`, `die-${i}`, 50);
+    // Queue 4 short-timeout messages
+    const diePromises = [];
+    for (let i = 1; i < 5; i++) diePromises.push(q.send(`p-${i}`, `die-${i}`, 50));
     await new Promise(r => setTimeout(r, 120));
-    for (let i = 1; i < 5; i++) assert((await q.send('x', 'y', 50)).startsWith('[queue-full]')); // actually wait for them
-    // Actually let's just await our promises
+    // All 4 queued entries should have timed out
+    for (const dp of diePromises) assert((await dp) === '[timeout]', 'Queued entry timed out');
     assertEq(q.timeoutCount, 4, '4 timeouts');
     q.completeActive('r1');
     assert(!q.isActive && q.queueLength === 0, 'Queue empty after skipping timed-out');
