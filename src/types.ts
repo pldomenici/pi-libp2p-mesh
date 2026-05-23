@@ -68,33 +68,6 @@ export interface AgentResponse {
   error: boolean;
 }
 
-/**
- * A stored memory about a peer, topic, or general fact.
- *
- * Memories are persisted in SQLite and allow agents to recall past
- * communications, preferences, and knowledge across restarts.
- */
-export interface MeshMemory {
-  /** Auto-increment ID (assigned by DB) */
-  id?: number;
-  /** PeerId this memory is about (optional — NULL for general facts) */
-  peerId?: string;
-  /** Agent name this memory is about */
-  agentName?: string;
-  /** Semantic key / topic (e.g. "interests", "expertise", "fact", "preference") */
-  key: string;
-  /** The memory content / value */
-  value: string;
-  /** Tags for categorization (JSON array of strings) */
-  tags: string[];
-  /** Importance 1–5 (higher = more important for retention) */
-  importance: number;
-  /** When this memory was created (epoch ms) */
-  createdAt: number;
-  /** When this memory was last updated (epoch ms) */
-  updatedAt: number;
-}
-
 /** GossipSub message envelope */
 export interface BroadcastMessage {
   /** Source agent name */
@@ -106,15 +79,7 @@ export interface BroadcastMessage {
   /** Message body */
   message: string;
   /** Optional message type hint */
-  type?: "announce" | "query" | "response" | "event" | "db:updated";
-  /**
-   * For `db:updated` broadcasts only: which DB table changed, so peers
-   * can efficiently re-query just the relevant table from shared memory.
-   * Only meaningful when `type === "db:updated"`.
-   */
-  table?: "peers" | "broadcasts" | "messages" | "kv" | "memories";
-  /** For `db:updated` broadcasts: the PeerId of the affected peer (if applicable). */
-  affectedPeerId?: string;
+  type?: "announce" | "query" | "response" | "event";
 }
 
 // ── Node Config ─────────────────────────────────────────────────────────────

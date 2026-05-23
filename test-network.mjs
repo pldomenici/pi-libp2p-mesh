@@ -14,8 +14,8 @@
  * @module test-network
  */
 
-import { MeshNode } from './src/node.ts';
-import { MeshProtocols } from './src/protocols.ts';
+import { MeshNode } from './dist/node.js';
+import { MeshProtocols } from './dist/protocols.js';
 import { v4 as uuidv4 } from 'uuid';
 
 // ── Config ──────────────────────────────────────────────────────────────────

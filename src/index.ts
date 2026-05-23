@@ -25,8 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types.js";
 import { MeshNode } from "./node.js";
 import { MeshProtocols } from "./protocols.js";
-import { registerMeshTools, registerMemoryTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
-import { MeshDatabase, DEFAULT_DB_PATH } from "./db.js";
+import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -37,15 +36,11 @@ let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
-/** Guard to prevent db:updated broadcast loops. */
-let _suppressDbNotify = false;
-
-// Placeholder — the real store is created in session_start after DB is opened
-let store: MeshStore = {
-  db: null as unknown as MeshDatabase,
-  agentName: "",
-  autoReplyAll: false,
-  notifyDbChanged: undefined,
+const store: MeshStore = {
+  peers: new Map(),
+  broadcastHistory: [],
+  agentName: "", // set during extension init after flag is read
+  autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -64,92 +59,12 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
   };
 }
 
-// ── DB Notification ──────────────────────────────────────────────────────────
-
-/**
- * Broadcast a compact "db:updated" notification so peers know which table
- * changed and can re-read from the shared-memory DB without re-requesting
- * all data over the wire.
- */
-async function notifyDbChanged(
-  table: "peers" | "broadcasts" | "messages" | "kv" | "memories",
-  affectedPeerId?: string,
-) {
-  if (_suppressDbNotify || !meshProtocols) return;
-  _suppressDbNotify = true;
-  try {
-    await meshProtocols.broadcast({
-      fromAgent: store.agentName,
-      message: `db:updated:${table}${affectedPeerId ? `:${affectedPeerId.slice(0, 12)}` : ""}`,
-      type: "db:updated",
-      table,
-      affectedPeerId,
-    } satisfies Omit<import("./types.js").BroadcastMessage, "fromPeerId" | "timestamp">);
-  } catch {
-    // Best-effort — don't block on notification failure
-  } finally {
-    _suppressDbNotify = false;
-  }
-}
-
-/**
- * Read the updated table from the shared DB when a `db:updated` broadcast
- * is received, and format a human-readable summary for the LLM.
- */
-function buildDbUpdatedMessage(msg: import("./types.js").BroadcastMessage): string {
-  const table = msg.table!;
-  const affectedPeerId = msg.affectedPeerId;
-
-  switch (table) {
-    case "peers": {
-      if (affectedPeerId) {
-        const peer = store.db.getPeer(affectedPeerId);
-        if (peer) {
-          const icon = peer.status === "connected" ? "🟢" : "🔴";
-          return `[DB update: ${msg.fromAgent} wrote to peers table]\n${icon} **${peer.agentName ?? "unknown"}** (${peer.id}) — ${peer.status}\nAddresses: ${peer.addresses.join(", ") || "none"}`;
-        }
-      }
-      // Full peer table summary
-      const all = store.db.getAllPeers();
-      const connected = all.filter(p => p.status === "connected").length;
-      return `[DB update: ${msg.fromAgent} wrote to peers table]\n${connected}/${all.length} peers in DB: ${all.map(p => (p.status === "connected" ? "🟢" : "🔴") + " " + (p.agentName ?? "unknown")).join(", ")}`;
-    }
-
-    case "broadcasts": {
-      const recent = store.db.getBroadcasts(5);
-      if (recent.length === 0) return `[DB update: ${msg.fromAgent} wrote to broadcasts table]\nNo broadcasts in history.`;
-      return `[DB update: ${msg.fromAgent} wrote to broadcasts table]\nLast ${recent.length} broadcasts:\n${recent.map(b => `  • ${b.fromAgent}: "${b.message.slice(0, 80)}…"`).join("\n")}`;
-    }
-
-    case "messages": {
-      const recent = store.db.getMessages(5);
-      if (recent.length === 0) return `[DB update: ${msg.fromAgent} wrote to messages table]\nNo messages in history.`;
-      return `[DB update: ${msg.fromAgent} wrote to messages table]\nLast ${recent.length} messages:\n${recent.map(m => `  • ${m.direction} ${m.from_agent}: "${m.message.slice(0, 80)}…"`).join("\n")}`;
-    }
-
-    case "memories": {
-      const count = store.db.getMemoriesCount();
-      if (affectedPeerId) {
-        const peer = store.db.getPeer(affectedPeerId);
-        const name = peer?.agentName ?? "unknown";
-        const peerMemories = store.db.recallByPeer(affectedPeerId);
-        const summaries = peerMemories.slice(0, 3).map(m => `  • [${m.key}] ${m.value.slice(0, 80)}…`).join("\n");
-        return `[DB update: ${msg.fromAgent} wrote to memories table]\n**${name}** has ${peerMemories.length} memory/memories\n${summaries || "  (none)"}`;
-      }
-      return `[DB update: ${msg.fromAgent} wrote to memories table]\nTotal memories: ${count}`;
-    }
-
-    default:
-      return `[DB update: ${msg.fromAgent} wrote to ${table}]`;
-  }
-}
-
 // ── Event Handler ────────────────────────────────────────────────────────────
 
 function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
   switch (ev.type) {
     case "peer:discovered": {
-      const existing = store.db.getPeer(ev.peer.id);
+      const existing = store.peers.get(ev.peer.id);
       if (existing) {
         // Merge addresses (discovery may fire after connect/identify)
         const existingAddrs = new Set(existing.addresses);
@@ -157,18 +72,16 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         existing.addresses = [...existingAddrs];
         // Don't downgrade from connected to disconnected if we already have an active connection
         existing.discoveredAt = ev.peer.discoveredAt;
-        store.db.upsertPeer(existing);
       } else {
-        store.db.upsertPeer(ev.peer);
+        store.peers.set(ev.peer.id, ev.peer);
       }
       if (meshProtocols) meshProtocols.handlePeerDiscovered(ev.peer);
-      notifyDbChanged("peers", ev.peer.id);
       notify(pi, `Peer discovered: ${ev.peer.id} (${ev.peer.addresses.join(", ")})`);
       break;
     }
 
     case "peer:connected": {
-      let p = store.db.getPeer(ev.peerId);
+      let p = store.peers.get(ev.peerId);
       if (!p) {
         // Inbound connection before mDNS discovery — create a placeholder
         p = {
@@ -177,29 +90,23 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
           status: "connected",
           discoveredAt: Date.now(),
         };
+        store.peers.set(ev.peerId, p);
+      } else {
+        p.status = "connected";
       }
-      p.status = "connected";
-      p.disconnectedAt = undefined;
-      store.db.upsertPeer(p);
-      notifyDbChanged("peers", ev.peerId);
       notify(pi, `Peer connected: ${ev.peerId}`);
       break;
     }
 
     case "peer:disconnected": {
-      const p = store.db.getPeer(ev.peerId);
-      if (p) {
-        p.status = "disconnected";
-        p.disconnectedAt = Date.now();
-        store.db.upsertPeer(p);
-        notifyDbChanged("peers", ev.peerId);
-      }
+      const p = store.peers.get(ev.peerId);
+      if (p) { p.status = "disconnected"; p.disconnectedAt = Date.now(); }
       notify(pi, `Peer disconnected: ${ev.peerId}`);
       break;
     }
 
     case "peer:identified": {
-      let p = store.db.getPeer(ev.peerId);
+      let p = store.peers.get(ev.peerId);
       if (!p) {
         // Identify before discovery — create a placeholder
         p = {
@@ -208,33 +115,23 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
           status: "connected",
           discoveredAt: Date.now(),
         };
+        store.peers.set(ev.peerId, p);
       }
       if (ev.agentName) {
         p.agentName = ev.agentName;
-        store.db.upsertPeer(p);
-        notifyDbChanged("peers", ev.peerId);
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
       }
       break;
     }
 
     case "message":
-      // Log incoming message to DB
-      store.db.logMessage({
-        direction: "incoming",
-        peerId: ev.request.fromPeerId,
-        requestId: ev.request.requestId,
-        fromAgent: ev.request.fromAgent,
-        message: ev.request.message,
-      });
-      notifyDbChanged("messages", ev.request.fromPeerId);
+      // Incoming direct message — could forward to LLM via pi.sendMessage
+      // For now we log; the LLM accesses via tools.
       notify(pi, `Message from ${ev.request.fromAgent}: ${ev.request.message.slice(0, 120)}`);
       break;
 
     case "broadcast":
       recordBroadcast(store, ev.message);
-      // Don't re-notify for broadcasts — that would create an infinite loop.
-      // The onBroadcast handler below handles db:updated notifications.
       notify(pi, `Broadcast from ${ev.message.fromAgent}: ${ev.message.message.slice(0, 120)}`);
       break;
 
@@ -261,11 +158,6 @@ export default async function (pi: ExtensionAPI) {
     type: "string",
     default: "pi-broadcast",
   });
-  pi.registerFlag("mesh-db-path", {
-    description: `Path to the SQLite database file (default: ${DEFAULT_DB_PATH})`,
-    type: "string",
-    default: "",
-  });
 
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
@@ -275,20 +167,7 @@ export default async function (pi: ExtensionAPI) {
     //   3. Default: pi-<hostname>
     const flagName = pi.getFlag("agent-name") as string;
     const envName = process.env.PI_MESH_NAME || process.env.PI_COMM_NAME;
-    const agentName = flagName || envName || `pi-${hostname}`;
-
-    // ── Open SQLite database (WAL mode, shared memory) ────────────────────
-    const dbPath = (pi.getFlag("mesh-db-path") as string) || DEFAULT_DB_PATH;
-    const db = new MeshDatabase(dbPath, agentName);
-    store = { db, agentName, autoReplyAll: false, notifyDbChanged };
-
-    // Mark peers from previous sessions as disconnected.
-    // Without this, restarted agents with new PeerIds leave stale
-    // "connected" entries in the DB forever.
-    const disconnected = db.disconnectPeersFromOtherSessions();
-    if (disconnected > 0) {
-      notify(pi, `Marked ${disconnected} peer(s) from previous sessions as disconnected`);
-    }
+    store.agentName = flagName || envName || `pi-${hostname}`;
 
     const config = buildConfig(pi);
 
@@ -299,8 +178,7 @@ export default async function (pi: ExtensionAPI) {
       // Wire protocols into tools so mesh_send / mesh_broadcast work
       setMeshProtocols(meshProtocols);
 
-      // Incoming direct messages — forward via pi's event bus.
-      // Logging is handled in handleNodeEvent (single source of truth).
+      // Incoming direct messages — forward via pi's event bus
       meshProtocols.onMessage = (_peerId, request) => {
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
       };
@@ -408,18 +286,6 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming broadcasts — record in store, notify, and optionally forward to LLM
       meshProtocols.onBroadcast = (msg) => {
-        // db:updated — a peer wrote to the shared DB. Read the updated table
-        // and notify the LLM without re-broadcasting (avoids infinite loop).
-        if (msg.type === "db:updated" && msg.table) {
-          if (!store.autoReplyAll) {
-            pi.sendUserMessage(
-              buildDbUpdatedMessage(msg),
-              { deliverAs: "steer" },
-            );
-          }
-          return; // Don't record as a broadcast — prevents loops
-        }
-
         handleNodeEvent(pi, { type: "broadcast", message: msg });
 
         // If auto-reply-all is off, forward the broadcast to the LLM so the agent
@@ -474,19 +340,11 @@ export default async function (pi: ExtensionAPI) {
     meshNode = null;
     meshProtocols = null;
     setMeshProtocols(null);
-
-    // WAL checkpoint + close database
-    if (store.db) {
-      store.db.checkpoint();
-      store.db.close();
-    }
-
     notify(pi, "Mesh node stopped");
   });
 
   // 3. Register mesh tools
   registerMeshTools(pi, store);
-  registerMemoryTools(pi, store);
 
   // 4. Register commands for manual control
   pi.registerCommand("auto-reply", {
@@ -589,9 +447,9 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const before = store.db.getAllPeers().length;
+      const before = store.peers.size;
       const removed = pruneAllDisconnected(store);
-      const after = store.db.getAllPeers().length;
+      const after = store.peers.size;
       // After pruning all disconnected, remaining peers are connected
       const connected = after;
 
@@ -601,133 +459,6 @@ export default async function (pi: ExtensionAPI) {
           : `🧹 Pruned ${removed} stale peer(s). ${before} → ${after} (${connected} connected)`,
         "info",
       );
-    },
-  });
-
-  pi.registerCommand("mesh-memory", {
-    description: "Store, recall, or summarize agent memories (persistent across restarts)",
-    handler: async (args, ctx) => {
-      if (!store.db) {
-        ctx.ui.notify("Database not available", "warning");
-        return;
-      }
-
-      const parts = args.trim().split(/\s+/);
-      const subcmd = parts[0]?.toLowerCase();
-
-      switch (subcmd) {
-        case "store": {
-          // mesh-memory store <key> <value> [--peer <peerId>] [--tag <tag>] [--importance <1-5>]
-          const key = parts[1];
-          const valueIdx = args.indexOf(parts[1] ?? "") + (parts[1]?.length ?? 0) + 1;
-          const valueEnd = args.indexOf(" --", valueIdx);
-          const value = valueEnd === -1 ? args.slice(valueIdx).trim() : args.slice(valueIdx, valueEnd).trim();
-          if (!key || !value) {
-            ctx.ui.notify("Usage: /mesh-memory store <key> <value> [--peer <peerId>] [--tag <tag>] [--importance <1-5>]", "warning");
-            return;
-          }
-
-          const peerFlag = args.match(/--peer\s+(\S+)/);
-          const tagFlag = args.match(/--tag\s+(\S+)/);
-          const impFlag = args.match(/--importance\s+(\d)/);
-          const tags = tagFlag ? tagFlag[1].split(",") : [];
-          const importance = impFlag ? Math.min(Math.max(parseInt(impFlag[1], 10), 1), 5) : 1;
-
-          const stored = store.db.storeMemory({
-            peerId: peerFlag?.[1],
-            agentName: undefined,
-            key,
-            value,
-            tags,
-            importance,
-          });
-          ctx.ui.notify(`🧠 Memory stored (id=${stored.id}) [${key}]: ${value.slice(0, 80)}…`, "info");
-          break;
-        }
-
-        case "recall":
-        case "list": {
-          // mesh-memory recall [--peer <peerId>] [--key <key>] [--agent <name>] [--search <query>]
-          const peerFilter = args.match(/--peer\s+(\S+)/);
-          const keyFilter = args.match(/--key\s+(\S+)/);
-          const agentFilter = args.match(/--agent\s+(\S+)/);
-          const searchQuery = args.match(/--search\s+(.+)/);
-
-          let memories = store.db.getAllMemories(50);
-          if (peerFilter) memories = store.db.recallByPeer(peerFilter[1]);
-          else if (keyFilter) memories = store.db.recallByKey(keyFilter[1]);
-          else if (agentFilter) memories = store.db.recallByAgent(agentFilter[1]);
-          else if (searchQuery) memories = store.db.searchMemories(searchQuery[1], 50);
-
-          if (memories.length === 0) {
-            ctx.ui.notify("🧠 No memories found.", "info");
-            return;
-          }
-
-          const lines = memories.slice(0, 20).map((m) => {
-            const stars = "⭐".repeat(m.importance);
-            const tagHint = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
-            return `  ${stars} \`${m.key}\` (id=${m.id})${tagHint}: ${m.value.slice(0, 100)}${m.value.length > 100 ? "…" : ""}`;
-          });
-          ctx.ui.notify(`🧠 ${memories.length} memory/memories:\n${lines.join("\n")}`, "info");
-          break;
-        }
-
-        case "summarize": {
-          // mesh-memory summarize <agentName> [--key <key>]
-          const agent = parts[1];
-          if (!agent) {
-            ctx.ui.notify("Usage: /mesh-memory summarize <agentName> [--key <key>]", "warning");
-            return;
-          }
-          const key = args.match(/--key\s+(\S+)/)?.[1] ?? "conversation_summary";
-          const recentMessages = store.db.getMessages(20);
-          const relevant = recentMessages.filter((m) => m.from_agent === agent);
-          if (relevant.length === 0) {
-            ctx.ui.notify(`No conversations found with ${agent}.`, "warning");
-            return;
-          }
-          const summaryValue = relevant
-            .slice(-10)
-            .map((m) => `[${new Date(m.timestamp).toISOString().slice(0, 16)}] ${m.direction === "incoming" ? "←" : "→"} ${m.from_agent}: "${m.message.slice(0, 200)}${m.message.length > 200 ? "…" : ""}"`)
-            .join("\n");
-          const stored = store.db.storeMemory({
-            agentName: agent,
-            key,
-            value: `Recent conversations (${relevant.length} messages):\n${summaryValue}`,
-            tags: ["auto-summary"],
-            importance: 3,
-          });
-          ctx.ui.notify(`📝 Summarized ${relevant.length} messages with ${agent} (memory id=${stored.id})`, "info");
-          break;
-        }
-
-        case "forget":
-        case "delete": {
-          // mesh-memory forget <id>   or   mesh-memory forget --key <key>
-          const id = parseInt(parts[1], 10);
-          if (!isNaN(id)) {
-            const ok = store.db.forgetMemory(id);
-            ctx.ui.notify(ok ? `🧹 Forgotten memory id=${id}.` : `No memory found with id=${id}.`, ok ? "info" : "warning");
-          } else {
-            const byKey = args.match(/--key\s+(\S+)/)?.[1];
-            if (byKey) {
-              const deleted = store.db.forgetByKey(byKey);
-              ctx.ui.notify(`🧹 Forgotten ${deleted} memory/memories with key "${byKey}".`, "info");
-            } else {
-              ctx.ui.notify("Usage: /mesh-memory forget <id> | --key <key>", "warning");
-            }
-          }
-          break;
-        }
-
-        default: {
-          const count = store.db.getMemoriesCount();
-          ctx.ui.notify(
-            `🧠 Agent Memory — ${count} total\n\nCommands:\n  /mesh-memory store <key> <value> [--peer <id>] [--tag <tag>] [--importance <1-5>]\n  /mesh-memory recall [--peer <id>] [--key <key>] [--agent <name>] [--search <query>]\n  /mesh-memory summarize <agentName> [--key <key>]\n  /mesh-memory forget <id> | --key <key>\n  /mesh-memory list (same as recall)`, "info");
-          break;
-        }
-      }
     },
   });
 }

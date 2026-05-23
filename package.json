@@ -55,9 +55,8 @@
     "test:fifo": "node test-fifo-queue.mjs",
     "test:identity": "npx tsx test-identity.mjs",
     "test:leak": "node test-leak.mjs",
-    "test:memory": "npx tsx test-memory.mjs",
     "test:negative": "npx tsx test-negative.mjs",
-    "test:all": "npm run test:extension && npm run test:fifo && npm run test:leak && npm run test:memory && npm run test:identity && npm run test:negative && npm run test",
+    "test:all": "npm run test:extension && npm run test:fifo && npm run test:leak && npm run test:identity && npm run test:negative && npm run test",
     "pretest": "npm run build"
   },
   "pi": {
@@ -80,13 +79,11 @@
     "@libp2p/tcp": "^11.0.20",
     "@libp2p/websockets": "^10.1.13",
     "@multiformats/multiaddr": "^13.0.3",
-    "better-sqlite3": "^12.10.0",
     "libp2p": "^3.3.1",
     "multiformats": "^14.0.0",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "typescript": "^6.0.3"
   },
   "peerDependencies": {

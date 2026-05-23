@@ -11,6 +11,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { peerIdFromString } from '@libp2p/peer-id';
+import { encode, decode } from 'cborg';
 import type { Libp2p, Stream } from '@libp2p/interface';
 import type { GossipsubMessage } from '@chainsafe/libp2p-gossipsub';
 import type { Uint8ArrayList } from 'uint8arraylist';
@@ -25,6 +26,7 @@ import type {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
 /**
  * Read the entirety of a libp2p {@link Stream} into a single `Uint8Array`,
  * respecting an optional {@link AbortSignal} to prevent indefinite hangs.
@@ -78,7 +80,7 @@ async function readStream(
  * Manages libp2p protocol handlers for the pi-agent mesh.
  *
  * **Direct messaging** (`/pi-agent/0.1.0`)
- * - Incoming requests are read as JSON {@link AgentRequest}, an automatic echo
+ * - Incoming requests are read as CBOR-encoded {@link AgentRequest}, an automatic echo
  *   {@link AgentResponse} is written back, and the registered `onMessage`
  *   callback is invoked.
  * - Outgoing requests use {@link MeshProtocols.sendMessage}.
@@ -219,7 +221,6 @@ export class MeshProtocols {
     request: Omit<AgentRequest, 'fromPeerId' | 'timestamp'>,
   ): Promise<AgentResponse> {
     const peerIdObj = peerIdFromString(peerId);
-    const encoder = new TextEncoder();
 
     // Build the full request envelope
     const fullRequest: AgentRequest = {
@@ -242,13 +243,13 @@ export class MeshProtocols {
       });
 
       // Write the request to the stream (v3: send + close to signal end-of-request)
-      stream.send(encoder.encode(JSON.stringify(fullRequest)));
+      stream.send(encode(fullRequest));
       await stream.close({ signal: abortController.signal });
 
       // Read the full response (abort-aware — prevents indefinite hang if the
       // remote peer closes write but never sends data)
       const raw = await readStream(stream, abortController.signal);
-      return JSON.parse(new TextDecoder().decode(raw)) as AgentResponse;
+      return decode(raw) as AgentResponse;
     } finally {
       clearTimeout(timeoutId);
       if (stream != null) {
@@ -291,8 +292,7 @@ export class MeshProtocols {
       timestamp: Date.now(),
     };
 
-    const encoder = new TextEncoder();
-    const data = encoder.encode(JSON.stringify(fullMessage));
+    const data = encode(fullMessage);
     const result = await pubsub.publish(topic, data);
 
     // Determine the number of subscribers reached.
@@ -360,14 +360,10 @@ export class MeshProtocols {
     stream: Stream,
     peerIdStr: string,
   ): Promise<void> {
-    const encoder = new TextEncoder();
-
     try {
       // Read the full request
       const raw = await readStream(stream);
-      const request: AgentRequest = JSON.parse(
-        new TextDecoder().decode(raw),
-      );
+      const request: AgentRequest = decode(raw) as AgentRequest;
 
       let responseMessage: string;
 
@@ -392,7 +388,7 @@ export class MeshProtocols {
       };
 
       // Write the response back (v3: send); the finally block handles close.
-      stream.send(encoder.encode(JSON.stringify(response)));
+      stream.send(encode(response));
 
       // Notify the registered callback (for logging/side effects)
       this._onMessage?.(peerIdStr, request);
@@ -411,7 +407,7 @@ export class MeshProtocols {
       };
 
       try {
-        stream.send(encoder.encode(JSON.stringify(errorResponse)));
+        stream.send(encode(errorResponse));
         await stream.close();
       } catch {
         // Best-effort — stream may already be broken
@@ -435,12 +431,12 @@ export class MeshProtocols {
     event: CustomEvent<GossipsubMessage>,
   ): Promise<void> {
     const { msg: message } = event.detail;
-    const raw = new TextDecoder().decode(message.data);
-    const broadcastMsg: BroadcastMessage = JSON.parse(raw);
+    const broadcastMsg: BroadcastMessage = decode(message.data) as BroadcastMessage;
 
     this._onBroadcast?.(broadcastMsg);
   }
 
+  /**
   /**
    * Resolve the GossipSub pubsub instance from wherever it is mounted
    * on the libp2p node.

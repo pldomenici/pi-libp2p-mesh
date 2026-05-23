@@ -20,42 +20,39 @@ function StringEnum<T extends readonly string[]>(values: T): TSchema {
 
 import type {
   MeshPeer,
-  MeshMemory,
   BroadcastMessage,
   MeshSendResult,
   MeshBroadcastResult,
   MeshDiscoverResult,
 } from "./types.js";
 import type { MeshProtocols } from "./protocols.js";
-import type { MeshDatabase } from "./db.js";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
 
 /**
  * Mutable store shared between the extension entry point and tools.
  * Populated in index.ts, consumed here.
- *
- * Peer and broadcast data is persisted to SQLite via {@link db}.
  */
 export interface MeshStore {
-  db: MeshDatabase;
+  peers: Map<string, MeshPeer>;
+  broadcastHistory: BroadcastMessage[];
   agentName: string;
   /** When true, all incoming messages auto-reply without involving the LLM. */
   autoReplyAll: boolean;
-  /**
-   * Optional callback to broadcast a `db:updated` notification when memory
-   * state changes, so same-machine peers with a shared DB can be notified.
-   * Set by index.ts after session_start.
-   */
-  notifyDbChanged?: (table: "memories", affectedPeerId?: string) => void;
 }
 
+/** M3: Maximum number of broadcast entries to retain before evicting oldest. */
+export const MAX_BROADCAST_HISTORY = 200;
+
 /**
- * Push a broadcast onto the store's database-backed history,
- * evicting the oldest entry if the cap is exceeded.
+ * Push a broadcast onto the store's history, evicting the oldest entry if
+ * the cap is exceeded (prevents unbounded memory growth).
  */
 export function recordBroadcast(store: MeshStore, msg: BroadcastMessage): void {
-  store.db.recordBroadcast(msg);
+  store.broadcastHistory.push(msg);
+  while (store.broadcastHistory.length > MAX_BROADCAST_HISTORY) {
+    store.broadcastHistory.shift();
+  }
 }
 
 /** Module-level reference — set by index.ts after session_start. */
@@ -82,7 +79,45 @@ const STALE_PEER_MS = 60 * 1000;
  * Returns the number of removed entries.
  */
 export function pruneStalePeers(store: MeshStore): number {
-  return store.db.pruneDedupByName() + store.db.pruneStale(STALE_PEER_MS);
+  const now = Date.now();
+  let removed = 0;
+
+  // Strategy 1: agent-name dedup — same name, keep connected, remove disconnected
+  const byName = new Map<string, MeshPeer[]>();
+  for (const [, peer] of store.peers) {
+    if (peer.agentName) {
+      const entries = byName.get(peer.agentName) ?? [];
+      entries.push(peer);
+      byName.set(peer.agentName, entries);
+    }
+  }
+  for (const [, entries] of byName) {
+    if (entries.length > 1) {
+      const connected = entries.filter((p) => p.status === "connected");
+      if (connected.length > 0) {
+        // Keep connected entry, remove disconnected ones with same name
+        for (const entry of entries) {
+          if (entry.status === "disconnected") {
+            store.peers.delete(entry.id);
+            removed++;
+          }
+        }
+      }
+    }
+  }
+
+  // Strategy 2: time-based cleanup
+  for (const [id, peer] of store.peers) {
+    if (peer.status === "disconnected") {
+      const lastSeen = peer.disconnectedAt ?? peer.discoveredAt;
+      if (now - lastSeen > STALE_PEER_MS) {
+        store.peers.delete(id);
+        removed++;
+      }
+    }
+  }
+
+  return removed;
 }
 
 /**
@@ -90,7 +125,14 @@ export function pruneStalePeers(store: MeshStore): number {
  * Returns count of removed entries.
  */
 export function pruneAllDisconnected(store: MeshStore): number {
-  return store.db.pruneAllDisconnected();
+  let removed = 0;
+  for (const [id, peer] of store.peers) {
+    if (peer.status === "disconnected") {
+      store.peers.delete(id);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 export interface PeerListResult {
@@ -102,7 +144,7 @@ export interface PeerListResult {
 /** Get current peer list after pruning stale entries. */
 export function listPeers(store: MeshStore): PeerListResult {
   pruneStalePeers(store);
-  const peers = store.db.getAllPeers();
+  const peers = [...store.peers.values()];
   const connected = peers.filter((p) => p.status === "connected").length;
   return { peers, connected, total: peers.length };
 }
@@ -223,17 +265,6 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         const finalResponse = response!;
 
-        // Log outgoing message + response to DB
-        store.db.logMessage({
-          direction: "outgoing",
-          peerId: params.peerId,
-          requestId: finalResponse.requestId,
-          fromAgent: finalResponse.fromAgent,
-          message: params.message,
-          response: finalResponse.message,
-          error: finalResponse.error,
-        });
-
         onUpdate?.({
           content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
           details: {},
@@ -255,16 +286,6 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           details: result,
         };
       } catch (err: any) {
-        // Log failed outgoing attempt to DB
-        store.db.logMessage({
-          direction: "outgoing",
-          peerId: params.peerId,
-          fromAgent: store.agentName,
-          message: params.message,
-          response: `[failed] ${err.message}`,
-          error: true,
-        });
-
         const result: MeshSendResult = {
           peerId: params.peerId,
           response: null,
@@ -329,7 +350,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           type: msgType,
         });
 
-        // Record in DB (cap eviction handled by db.recordBroadcast)
+        // Record in history (capped at MAX_BROADCAST_HISTORY)
         recordBroadcast(store, {
           fromAgent: store.agentName,
           fromPeerId: "self",
@@ -438,9 +459,9 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     parameters: Type.Object({}),
 
     async execute() {
-      const before = store.db.getAllPeers().length;
+      const before = store.peers.size;
       const removed = pruneAllDisconnected(store);
-      const after = store.db.getAllPeers().length;
+      const after = store.peers.size;
       const { connected } = listPeers(store);
 
       const text =
@@ -452,291 +473,6 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         content: [{ type: "text", text }],
         details: { removed, before, after, connected },
       };
-    },
-  });
-}
-
-// ── Memory Tools ─────────────────────────────────────────────────────────────
-
-/**
- * Register the mesh_memory tool for storing and recalling agent memories.
- */
-export function registerMemoryTools(pi: ExtensionAPI, store: MeshStore): void {
-  // ── mesh_memory ────────────────────────────────────────────────────────
-  pi.registerTool({
-    name: "mesh_memory",
-    label: "Agent Memory",
-    description:
-      "Store and recall agent memories about peers and conversations. " +
-      "Use this to remember facts about other agents, recall past conversations, " +
-      "and maintain context across sessions. Memories persist in SQLite.",
-    promptSnippet: "Store or recall agent memories from the mesh",
-    promptGuidelines: [
-      "Use mesh_memory with action='store' to save important facts about a peer (e.g., their interests, expertise, decisions).",
-      "Use mesh_memory with action='recall' to retrieve memories about a peer or topic before messaging them.",
-      "Use mesh_memory with action='summarize' to generate a summary of recent conversations with a peer.",
-      "Use mesh_memory with action='forget' to delete outdated or incorrect memories.",
-      "Store facts proactively — memories persist across restarts and help maintain long-term context.",
-    ],
-    parameters: Type.Object({
-      action: StringEnum(["store", "recall", "forget", "summarize"] as const),
-      key: Type.Optional(
-        Type.String({
-          description:
-            "Semantic key/topic for the memory (e.g. 'interests', 'expertise', 'preference', 'decision'). " +
-            "Required for store and forget actions.",
-        }),
-      ),
-      value: Type.Optional(
-        Type.String({
-          description:
-            "The memory content to store. Required for store action.",
-        }),
-      ),
-      peerId: Type.Optional(
-        Type.String({
-          description:
-            "PeerId this memory is about. Omit for general facts.",
-        }),
-      ),
-      agentName: Type.Optional(
-        Type.String({
-          description:
-            "Agent name this memory is about.",
-        }),
-      ),
-      query: Type.Optional(
-        Type.String({
-          description:
-            "Search query for recall action. Searches memory key and value fields.",
-        }),
-      ),
-      tags: Type.Optional(
-        Type.String({
-          description:
-            "Comma-separated tags for categorization (e.g. 'coding,architecture,protocol').",
-        }),
-      ),
-      importance: Type.Optional(
-        Type.Integer({
-          description:
-            "Importance level 1-5 (higher = more important). Default: 1.",
-          minimum: 1,
-          maximum: 5,
-        }),
-      ),
-      memoryId: Type.Optional(
-        Type.Integer({
-          description:
-            "Memory ID to forget. Required for forget action (instead of key).",
-        }),
-      ),
-      limit: Type.Optional(
-        Type.Integer({
-          description:
-            "Maximum number of memories to return (default: 10, max: 50).",
-          minimum: 1,
-          maximum: 50,
-        }),
-      ),
-    }),
-
-    async execute(_toolCallId: string, params: Record<string, any>, _signal?: any, _onUpdate?: any): Promise<any> {
-      const action = params.action as string;
-      const key = params.key as string | undefined;
-      const value = params.value as string | undefined;
-      const peerId = params.peerId as string | undefined;
-      const agentName = params.agentName as string | undefined;
-      const query = params.query as string | undefined;
-      const tagsStr = params.tags as string | undefined;
-      const importance = (params.importance as number | undefined) ?? 1;
-      const memoryId = params.memoryId as number | undefined;
-      const limit = Math.min((params.limit as number | undefined) ?? 10, 50);
-
-      const tags = tagsStr
-        ? tagsStr.split(",").map((t: string) => t.trim()).filter(Boolean)
-        : [];
-
-      switch (action) {
-        // ── Store ────────────────────────────────────────────────────────
-        case "store": {
-          if (!key || !value) {
-            return {
-              content: [{ type: "text", text: "❌ 'key' and 'value' are required for store action." }],
-              details: { action: "store", error: "missing required parameters" },
-            };
-          }
-
-          const memory: Omit<MeshMemory, "id" | "createdAt" | "updatedAt"> = {
-            peerId,
-            agentName,
-            key,
-            value,
-            tags,
-            importance,
-          };
-
-          const stored = store.db.storeMemory(memory);
-
-          // Notify peers about the new memory (if on same machine with shared DB)
-          store.notifyDbChanged?.("memories", peerId);
-
-          const tagHint = tags.length ? ` [${tags.join(", ")}]` : "";
-          return {
-            content: [{
-              type: "text",
-              text: `🧠 Memory stored (id=${stored.id})${tagHint}\n**${key}:** ${value}\nImportance: ${importance}/5`,
-            }],
-            details: { action, memory: stored, error: null },
-          };
-        }
-
-        // ── Recall ───────────────────────────────────────────────────────
-        case "recall": {
-          let memories: MeshMemory[] = [];
-
-          if (query) {
-            memories = store.db.searchMemories(query, limit);
-          } else if (peerId) {
-            memories = store.db.recallByPeer(peerId);
-          } else if (agentName) {
-            memories = store.db.recallByAgent(agentName);
-          } else if (key) {
-            memories = store.db.recallByKey(key);
-          } else {
-            memories = store.db.getAllMemories(limit);
-          }
-
-          // Apply limit
-          memories = memories.slice(0, limit);
-
-          if (memories.length === 0) {
-            return {
-              content: [{ type: "text", text: "🧠 No matching memories found." }],
-              details: { action, count: 0, memories: [], error: null },
-            };
-          }
-
-          // Group by peer for readability
-          const grouped = new Map<string, MeshMemory[]>();
-          for (const m of memories) {
-            const groupKey = m.agentName ?? m.peerId ?? "general";
-            if (!grouped.has(groupKey)) grouped.set(groupKey, []);
-            grouped.get(groupKey)!.push(m);
-          }
-
-          const lines: string[] = [];
-          lines.push(`🧠 **${memories.length} memory/memories found:**\n`);
-          for (const [group, ms] of grouped) {
-            const label = group === "general" ? "**General**" : `**${group}**`;
-            lines.push(`${label}:`);
-            for (const m of ms) {
-              const stars = "⭐".repeat(m.importance);
-              const tagHint = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
-              lines.push(`  ${stars} \`${m.key}\`: ${m.value.slice(0, 200)}${tagHint} _(id=${m.id})_`);
-            }
-            lines.push("");
-          }
-
-          return {
-            content: [{ type: "text", text: lines.join("\n") }],
-            details: { action, count: memories.length, memories, error: null },
-          };
-        }
-
-        // ── Forget ───────────────────────────────────────────────────────
-        case "forget": {
-          if (memoryId != null) {
-            const deleted = store.db.forgetMemory(memoryId);
-            if (deleted) {
-              store.notifyDbChanged?.("memories");
-              return {
-                content: [{ type: "text", text: `🧹 Forgotten memory id=${memoryId}.` }],
-                details: { action, deleted: 1, error: null },
-              };
-            }
-            return {
-              content: [{ type: "text", text: `❌ No memory found with id=${memoryId}.` }],
-              details: { action, deleted: 0, error: "not found" },
-            };
-          }
-
-          if (key) {
-            const deleted = store.db.forgetByKey(key);
-            store.notifyDbChanged?.("memories");
-            return {
-              content: [{ type: "text", text: `🧹 Forgotten ${deleted} memory/memories with key "${key}".` }],
-              details: { action, deleted, error: null },
-            };
-          }
-
-          return {
-            content: [{ type: "text", text: "❌ Provide 'memoryId' or 'key' to forget." }],
-            details: { action, error: "missing memoryId or key" },
-          };
-        }
-
-        // ── Summarize ───────────────────────────────────────────────────
-        case "summarize": {
-          const targetPeer = peerId ?? null;
-          const targetAgent = agentName ?? null;
-
-          // Fetch recent messages with this peer
-          const recentMessages = store.db.getMessages(limit);
-          const relevant = recentMessages.filter((m) => {
-            return (targetPeer && m.peer_id === targetPeer) ||
-                   (targetAgent && m.from_agent === targetAgent);
-          });
-
-          if (relevant.length === 0) {
-            return {
-              content: [{
-                type: "text",
-                text: `❌ No conversations found with ${targetAgent ?? targetPeer ?? "that peer"}.`,
-              }],
-              details: { action, messages: 0, error: null },
-            };
-          }
-
-          // Generate a summary memory from the recent conversation history
-          const summaryKey = key ?? "conversation_summary";
-          const summaryValue = relevant
-            .slice(-10)
-            .map((m) => `[${new Date(m.timestamp).toISOString().slice(0, 16)}] ${m.direction === "incoming" ? "←" : "→"} ${m.from_agent}: "${m.message.slice(0, 200)}${m.message.length > 200 ? "…" : ""}"`)
-            .join("\n");
-
-          const summary: Omit<MeshMemory, "id" | "createdAt" | "updatedAt"> = {
-            peerId: targetPeer ?? undefined,
-            agentName: targetAgent ?? relevant[0]?.from_agent ?? undefined,
-            key: summaryKey,
-            value: `Recent conversations (${relevant.length} messages):\n${summaryValue}`,
-            tags: [...tags, "auto-summary"],
-            importance: Math.min(importance + 1, 5), // auto-summaries get +1 importance
-          };
-
-          const stored = store.db.storeMemory(summary);
-          store.notifyDbChanged?.("memories", targetPeer ?? undefined);
-
-          return {
-            content: [{
-              type: "text",
-              text: `📝 Generated summary from ${relevant.length} message(s) with **${summary.agentName}** and stored as memory (id=${stored.id}).\n\nKey: \`${summaryKey}\`\nImportance: ${stored.importance}/5`,
-            }],
-            details: {
-              action,
-              messagesCount: relevant.length,
-              storedMemory: stored,
-              error: null,
-            },
-          };
-        }
-
-        default:
-          return {
-            content: [{ type: "text", text: `❌ Unknown action: ${action}.` }],
-            details: { action, error: `unknown action: ${action}` },
-          };
-      }
     },
   });
 }
