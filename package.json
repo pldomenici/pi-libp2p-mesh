@@ -55,8 +55,9 @@
     "test:fifo": "node test-fifo-queue.mjs",
     "test:identity": "npx tsx test-identity.mjs",
     "test:leak": "node test-leak.mjs",
+    "test:memory": "npx tsx test-memory.mjs",
     "test:negative": "npx tsx test-negative.mjs",
-    "test:all": "npm run test:extension && npm run test:fifo && npm run test:leak && npm run test:identity && npm run test:negative && npm run test",
+    "test:all": "npm run test:extension && npm run test:fifo && npm run test:leak && npm run test:memory && npm run test:identity && npm run test:negative && npm run test",
     "pretest": "npm run build"
   },
   "pi": {
