@@ -127,7 +127,7 @@ export class MeshProtocols {
   private _onRequest?: (peerId: string, request: AgentRequest) => Promise<string>;
 
   /**
-   * @param libp2p - A started libp2p v2 node instance.
+   * @param libp2p - A started libp2p v3 node instance.
    * @param config - Mesh configuration (agent name, ports, topics, etc.).
    */
   constructor(libp2p: Libp2p, config: MeshConfig) {
@@ -242,7 +242,7 @@ export class MeshProtocols {
         signal: abortController.signal,
       });
 
-      // Write the request to the stream (v3: send + close write side)
+      // Write the request to the stream (v3: send + close to signal end-of-request)
       stream.send(encoder.encode(JSON.stringify(fullRequest)));
       await stream.close({ signal: abortController.signal });
 
@@ -392,9 +392,8 @@ export class MeshProtocols {
         error: false,
       };
 
-      // Write the response back (v3: send + close write side)
+      // Write the response back (v3: send); the finally block handles close.
       stream.send(encoder.encode(JSON.stringify(response)));
-      await stream.close();
 
       // Notify the registered callback (for logging/side effects)
       this._onMessage?.(peerIdStr, request);
@@ -444,13 +443,14 @@ export class MeshProtocols {
   }
 
   /**
-   * Resolve the GossipSub {@link PubSub} instance from wherever it is mounted
+  /**
+   * Resolve the GossipSub pubsub instance from wherever it is mounted
    * on the libp2p node.
    *
-   * Checks `libp2p.services.pubsub` first (libp2p v2 service pattern), then
+   * Checks `libp2p.services.pubsub` first (libp2p v3 service pattern), then
    * falls back to `libp2p.pubsub` for compatibility.
    *
-   * @returns The `PubSub` instance, or `null` if not available.
+   * @returns The pubsub service instance, or `null` if not available.
    */
   private resolvePubsub(): any | null {
     const libp2pAny = this.libp2p as unknown as Record<string, unknown>;

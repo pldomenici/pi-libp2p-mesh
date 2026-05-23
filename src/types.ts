@@ -123,8 +123,7 @@ export type MeshNodeEvent =
   | { type: "peer:disconnected"; peerId: string }
   | { type: "peer:identified"; peerId: string; agentName: string; agentVersion: string }
   | { type: "message"; fromPeerId: string; request: AgentRequest }
-  | { type: "broadcast"; message: BroadcastMessage }
-  | { type: "error"; error: Error };
+  | { type: "broadcast"; message: BroadcastMessage };
 
 export type MeshNodeEventHandler = (event: MeshNodeEvent) => void;
 

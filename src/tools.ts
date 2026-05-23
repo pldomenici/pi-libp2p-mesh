@@ -62,7 +62,7 @@ let meshProtocols: MeshProtocols | null = null;
  * Wire the active MeshProtocols instance so tools can use it.
  * Called from index.ts after session_start.
  */
-export function setMeshProtocols(protocols: MeshProtocols): void {
+export function setMeshProtocols(protocols: MeshProtocols | null): void {
   meshProtocols = protocols;
 }
 

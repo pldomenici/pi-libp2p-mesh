@@ -17,8 +17,8 @@
  *   session_shutdown → stop libp2p node, clean up
  *
  * Configuration:
- *   The mesh picks up the agent name from the pi config. Per-session settings
- *   are stored via pi.appendEntry() and restored on reload.
+ *   The mesh picks up the agent name from the pi config (--agent-name flag,
+ *   PI_MESH_NAME env var, or defaults to pi-<hostname>).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -30,7 +30,7 @@ import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
 // This singleton is re-created on each extension load (session reload).
-// Persisted peer book survives restarts via pi.appendEntry / session_start restore.
+// Peer state is re-discovered on each session start.
 
 let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
@@ -135,9 +135,6 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       notify(pi, `Broadcast from ${ev.message.fromAgent}: ${ev.message.message.slice(0, 120)}`);
       break;
 
-    case "error":
-      notify(pi, ev.error.message, "error");
-      break;
   }
 }
 
@@ -342,7 +339,7 @@ export default async function (pi: ExtensionAPI) {
     }
     meshNode = null;
     meshProtocols = null;
-    setMeshProtocols(null as any);
+    setMeshProtocols(null);
     notify(pi, "Mesh node stopped");
   });
 
