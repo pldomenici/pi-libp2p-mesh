@@ -56,6 +56,8 @@ export class MeshNode {
   readonly peerId: string;
   /** The underlying libp2p instance. */
   readonly libp2p: Libp2p;
+  /** Extension version string reported via Identify protocol. */
+  readonly extensionVersion: string;
   /** Listening multiaddrs (populated after start()). */
   multiaddrs: string[] = [];
   /** Whether the node is currently running. */
@@ -77,10 +79,11 @@ export class MeshNode {
   private dialDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DIAL_DEBOUNCE_MS = 200;
 
-  private constructor(libp2p: Libp2p, config: MeshConfig) {
+  private constructor(libp2p: Libp2p, config: MeshConfig, extensionVersion?: string) {
     this.libp2p = libp2p;
     this.peerId = libp2p.peerId.toString();
     this.config = config;
+    this.extensionVersion = extensionVersion ?? "unknown";
     this.peerStore = new Map();
     this.pendingDials = new Set();
   }
@@ -93,7 +96,7 @@ export class MeshNode {
    * Generates an Ed25519 keypair and PeerId, assembles the libp2p configuration,
    * and creates a libp2p node. Call `start()` afterwards to begin listening.
    */
-  static async create(config: MeshConfig): Promise<MeshNode> {
+  static async create(config: MeshConfig, extensionVersion?: string): Promise<MeshNode> {
     const mergedConfig = { ...DEFAULT_CONFIG, ...config };
 
     // M1: Accept a pre-existing private key for stable identity across restarts.
@@ -140,7 +143,11 @@ export class MeshNode {
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
       nodeInfo: {
-        userAgent: `pi-libp2p-mesh/${mergedConfig.agentName}`,
+        userAgent: `pi-libp2p-mesh/${extensionVersion ?? "unknown"}/${mergedConfig.agentName}`,
+        // Encode extension version + agent name in nodeInfo.version for stale-build
+        // detection. Identify protocol reports this as agentVersion="pi-libp2p-mesh/<extVersion>/<agentName>".
+        name: "pi-libp2p-mesh",
+        version: `${extensionVersion ?? "unknown"}/${mergedConfig.agentName}`,
       },
       services: {
         identify: identify(),
@@ -175,7 +182,7 @@ export class MeshNode {
 
     const node = await createLibp2p(libp2pConfig);
 
-    return new MeshNode(node, mergedConfig);
+    return new MeshNode(node, mergedConfig, extensionVersion);
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -444,12 +451,30 @@ export class MeshNode {
     if (peerIdStr === this.peerId) return;
 
     // Extract agent name from the agentVersion string.
-    // Accepts both plain names (e.g. "bob") and prefixed ("pi-libp2p-mesh/bob").
+    // Format: pi-libp2p-mesh/<extVersion>/<agentName>
+    // Legacy: pi-libp2p-mesh/<agentName> or just <agentName>
     const agentVersion = detail.agentVersion ?? "";
     const prefix = "pi-libp2p-mesh/";
-    const agentName = agentVersion.startsWith(prefix)
-      ? agentVersion.slice(prefix.length)
-      : agentVersion;
+    let extensionVersion: string | undefined;
+    let agentName: string;
+
+    if (agentVersion.startsWith(prefix)) {
+      const rest = agentVersion.slice(prefix.length);
+      const parts = rest.split("/");
+      if (parts.length >= 2 && parts[0].match(/^\d+\.\d+\.\d+/)) {
+        // New format: pi-libp2p-mesh/<extVersion>/<agentName>
+        extensionVersion = parts[0];
+        agentName = parts.slice(1).join("/");
+      } else {
+        // Legacy format: pi-libp2p-mesh/<agentName>
+        extensionVersion = undefined;
+        agentName = rest;
+      }
+    } else {
+      // Plain name (e.g. "bob")
+      extensionVersion = undefined;
+      agentName = agentVersion;
+    }
 
     const stored = this.peerStore.get(peerIdStr);
     if (stored) {
@@ -478,7 +503,8 @@ export class MeshNode {
       type: "peer:identified",
       peerId: peerIdStr,
       agentName,
-      agentVersion,
+      agentVersion: detail.agentVersion ?? "",
+      extensionVersion,
     });
   };
 }

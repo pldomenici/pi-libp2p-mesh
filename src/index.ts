@@ -29,6 +29,9 @@ import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemor
 import { AgentMemory, resolveMemoryConfig } from "./memory.js";
 import os from "node:os";
 
+/** Extension version — reported via Identify protocol for stale-build detection. */
+export const EXTENSION_VERSION = "0.3.0";
+
 // ── Shared State ─────────────────────────────────────────────────────────────
 // This singleton is re-created on each extension load (session reload).
 // Peer state is re-discovered on each session start.
@@ -145,6 +148,14 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       if (ev.agentName) {
         p.agentName = ev.agentName;
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
+      }
+      // Detect stale builds: if the peer's extension version differs from ours, warn
+      if (ev.extensionVersion && ev.extensionVersion !== EXTENSION_VERSION) {
+        notify(
+          pi,
+          `⚠️ Version mismatch with ${ev.agentName || ev.peerId.slice(0, 12) + "…"}: they run v${ev.extensionVersion}, we run v${EXTENSION_VERSION}`,
+          "warning",
+        );
       }
       break;
     }
@@ -274,21 +285,32 @@ export default async function (pi: ExtensionAPI) {
       });
       setAgentMemory(agentMemory);
       notify(pi, `Memory connected — collection "${agentMemory.collectionName}"`);
+      ctx.ui.notify(`🧠 ChromaDB memory active — collection "${agentMemory.collectionName}"`, "info");
     } catch (err: any) {
-      console.warn(`[pi-libp2p-mesh] ChromaDB unreachable — memory disabled for this session: ${err.message}`);
+      const reason = err.message || String(err);
+      console.warn(`[pi-libp2p-mesh] Memory initialization failed — memory tools disabled for this session: ${reason}`);
+      ctx.ui.notify(`⚠️ ChromaDB memory unavailable: ${reason}. Memory tools disabled.`, "warning");
       agentMemory = null;
       setAgentMemory(null);
     }
 
     try {
-      meshNode = await MeshNode.create(config);
-      meshProtocols = new MeshProtocols(meshNode.libp2p, config);
+      meshNode = await MeshNode.create(config, EXTENSION_VERSION);
+      meshProtocols = new MeshProtocols(meshNode.libp2p, config, EXTENSION_VERSION);
 
       // Wire protocols into tools so mesh_send / mesh_broadcast work
       setMeshProtocols(meshProtocols);
 
       // Incoming direct messages — forward via pi's event bus
       meshProtocols.onMessage = (_peerId, request) => {
+        // Detect stale peers: if the request includes a version and it doesn't match
+        // ours, log a warning (identify protocol already handles this, but this is
+        // an extra signal for the operator).
+        if ((request as any).extensionVersion && (request as any).extensionVersion !== EXTENSION_VERSION) {
+          console.warn(
+            `[pi-libp2p-mesh] Version mismatch: peer ${request.fromAgent} runs v${(request as any).extensionVersion}, we run v${EXTENSION_VERSION}`,
+          );
+        }
         handleNodeEvent(pi, { type: "message", fromPeerId: request.fromPeerId, request });
       };
 
@@ -368,7 +390,7 @@ export default async function (pi: ExtensionAPI) {
             value: `[Request from ${req.request.fromAgent}] ${req.request.message}\n[Response] ${responseText}`,
             metadata: { type: "conversation_turn", requestId: req.request.requestId },
           }).catch((err) => {
-            console.debug("[pi-libp2p-mesh] auto-save failed:", (err as Error).message);
+            console.warn("[pi-libp2p-mesh] exchange auto-save failed:", (err as Error).message);
           });
         }
 
@@ -446,7 +468,7 @@ export default async function (pi: ExtensionAPI) {
             value: `[${msg.type ?? "announce"}] ${msg.message}`,
             metadata: { type: "broadcast" },
           }).catch((err) => {
-            console.debug("[pi-libp2p-mesh] broadcast auto-save failed:", (err as Error).message);
+            console.warn("[pi-libp2p-mesh] broadcast auto-save failed:", (err as Error).message);
           });
         }
       };

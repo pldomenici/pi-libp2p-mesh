@@ -143,6 +143,55 @@ Search uses the vector embedding — it finds entries whose *meaning* is similar
 
 ---
 
+## PeerId Mapping — Know Who You're Talking To
+
+A single libp2p agent can be reachable through **multiple connection PeerIds** — for example, one via TCP and another via WebSocket to the same underlying node. This means:
+
+- **`mesh_list_peers` may show multiple entries with the same `agentName`** but different PeerIds
+- **Memories stored under one connection PeerId are isolated** from those stored under the agent's canonical node PeerId
+- When the agent uses `memory_recall` on its OWN peerId, it queries the ChromaDB entries keyed to its **node PeerId**, not the connection PeerIds you see in `mesh_list_peers`
+
+### Practical implications
+
+```
+# You see two connected peers named "pi-fedora-desktop":
+mesh_list_peers
+# → 12D3KooWKgom… (TCP connection)
+# → 12D3KooWQwXX… (WebSocket connection)
+
+# The agent's actual node PeerId might be different (e.g., 12D3KooWKGP1…)
+# Memories stored under 12D3KooWKgom… are NOT visible under 12D3KooWKGP1…
+```
+
+**Rule of thumb:** When storing memories about a peer, use the PeerId from `mesh_list_peers` that you're communicating through. When asking a peer to recall memories about itself, be aware that its self-view peerId may differ from the connection peerId you're using. If a peer can't find memories you stored, try having it check with `memory_keys` on its own node PeerId first to discover the mapping.
+
+---
+
+## Semantic Search Tips
+
+### Query construction matters
+
+Semantic search uses vector embeddings — the query is converted to a 384-dimensional vector and matched against all stored entries. **Multi-concept queries can dilute the embedding**, causing the search to miss entries that contain exact keywords:
+
+| Query style | Result quality |
+|---|---|
+| `"dark mode theme VSCode vim keybindings Fedora KDE Plasma"` (6 concepts) | ❌ Only 2 matches, dilution |
+| `"VSCode vim keybindings"` (2 concepts) | ✅ Focused, higher recall |
+| `"ChromaDB persistence WAL SQLite recovery"` (1 theme, related terms) | ✅ Best — 5 matches at 0.33–0.51 |
+
+**Best practice:** Use **1–2 focused concepts** per search query rather than listing everything you're looking for. If you need broad coverage, run multiple targeted searches.
+
+### Distance interpretation
+
+| Distance | Meaning |
+|---|---|
+| 0.00–0.30 | Near-identical meaning |
+| 0.30–0.45 | Strong semantic overlap |
+| 0.45–0.60 | Related topic |
+| > 0.60 | Filtered out (below threshold) |
+
+---
+
 ## Read Limits
 
 All values are **truncated to 10,000 characters** by default and at most **50 entries** are returned per call. This is configurable (your operator can change it with `--mesh-memory-preset` or individual flags), but you should assume these limits when designing your memory strategy:
@@ -150,6 +199,8 @@ All values are **truncated to 10,000 characters** by default and at most **50 en
 - Keep `memory_store` values concise — aim for 1–5 paragraphs, not full transcripts
 - Use specific keys so `memory_recall` hits a focused set rather than broad queries
 - Don't dump entire codebases into a single memory entry; use project-level context instead
+- **Recall order is not guaranteed to match insertion order.** ChromaDB may return entries in a different sequence than they were stored. This is harmless for the append-only design but means you shouldn't rely on positional indexing.
+- **50KB payloads work** and are correctly embedded, searched, and truncated. The guidance to keep entries concise is for LLM context efficiency, not a hard technical limit.
 
 ---
 

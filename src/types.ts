@@ -51,6 +51,8 @@ export interface AgentRequest {
   autoReply?: boolean;
   /** Optional per-request timeout override (ms). Default: 60_000. */
   timeoutMs?: number;
+  /** Extension version of the sender — for stale-build detection. */
+  extensionVersion?: string;
 }
 
 export interface AgentResponse {
@@ -133,7 +135,7 @@ export type MeshNodeEvent =
   | { type: "peer:discovered"; peer: MeshPeer }
   | { type: "peer:connected"; peerId: string }
   | { type: "peer:disconnected"; peerId: string }
-  | { type: "peer:identified"; peerId: string; agentName: string; agentVersion: string }
+  | { type: "peer:identified"; peerId: string; agentName: string; agentVersion: string; extensionVersion?: string }
   | { type: "message"; fromPeerId: string; request: AgentRequest }
   | { type: "broadcast"; message: BroadcastMessage };
 

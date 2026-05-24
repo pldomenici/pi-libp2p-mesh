@@ -122,6 +122,7 @@ export class MeshProtocols {
   private readonly libp2p: Libp2p;
   private readonly config: MeshConfig;
   private readonly protocol = '/pi-agent/0.1.0';
+  private readonly extensionVersion?: string;
 
   private _onMessage?: (peerId: string, request: AgentRequest) => void;
   private _onBroadcast?: (msg: BroadcastMessage) => void;
@@ -131,9 +132,10 @@ export class MeshProtocols {
    * @param libp2p - A started libp2p v3 node instance.
    * @param config - Mesh configuration (agent name, ports, topics, etc.).
    */
-  constructor(libp2p: Libp2p, config: MeshConfig) {
+  constructor(libp2p: Libp2p, config: MeshConfig, extensionVersion?: string) {
     this.libp2p = libp2p;
     this.config = config;
+    this.extensionVersion = extensionVersion;
 
     // 1. Register the direct-messaging protocol handler
     libp2p
@@ -228,6 +230,7 @@ export class MeshProtocols {
       fromPeerId: this.libp2p.peerId.toString(),
       timestamp: Date.now(),
       autoReply: request.autoReply,
+      extensionVersion: this.extensionVersion,
     };
 
     // Create an AbortController for the timeout (default 60s; per-request override)

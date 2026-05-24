@@ -285,8 +285,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             key: "exchange",
             value: `[Sent] ${params.message}\n[Response from ${finalResponse.fromAgent}] ${finalResponse.message}`,
             metadata: { type: "conversation_turn" },
-          }).catch(() => {
-            // Silently skip — mesh continues normally
+          }).catch((err) => {
+            console.warn("[pi-libp2p-mesh] outgoing exchange auto-save failed:", (err as Error).message);
           });
         }
 
@@ -817,6 +817,48 @@ export function registerMemoryTools(pi: ExtensionAPI, _store: MeshStore): void {
         return {
           content: [{ type: "text", text: `Failed to list keys: ${err.message}` } as const],
           details: { keys: [] as any[], count: 0, totalEntries: 0, error: err.message } as any,
+        };
+      }
+    },
+  });
+
+  // ── memory_reconnect ───────────────────────────────────────────────────
+  pi.registerTool({
+    name: "memory_reconnect",
+    label: "Reconnect Memory",
+    description:
+      "Manually reconnect to the ChromaDB collection. Use this after ChromaDB " +
+      "restarts or if the collection was externally deleted and recreated. " +
+      "Normally not needed — memory operations auto-recover on first failure.",
+    promptSnippet: "Reconnect to ChromaDB memory collection",
+    promptGuidelines: [
+      "Use memory_reconnect after ChromaDB restarts or collection wipes if memory tools are returning errors.",
+    ],
+    parameters: Type.Object({}),
+
+    async execute(_toolCallId: string, _params: any, _signal?: AbortSignal) {
+      if (!agentMemory) {
+        return {
+          content: [{ type: "text", text: "Memory is not available. ChromaDB may not be running." } as const],
+          details: { reconnected: false, error: "memory not available", collectionName: undefined as string | undefined },
+        };
+      }
+
+      try {
+        await agentMemory.reconnect();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🔌 Reconnected to ChromaDB collection "${agentMemory.collectionName}".`,
+            } as const,
+          ],
+          details: { reconnected: true, collectionName: agentMemory.collectionName, error: undefined as string | undefined },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Failed to reconnect: ${err.message}` } as const],
+          details: { reconnected: false, error: err.message, collectionName: undefined as string | undefined },
         };
       }
     },
