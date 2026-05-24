@@ -145,7 +145,7 @@ export class AgentMemory {
 
     if (!result.ids.length) return [];
 
-    return result.ids.map((id, i) => ({
+    const entries = result.ids.map((id, i) => ({
       id,
       peerId: (result.metadatas[i] as any).peerId ?? "",
       key: (result.metadatas[i] as any).key ?? "",
@@ -154,6 +154,11 @@ export class AgentMemory {
       type: (result.metadatas[i] as any).type,
       metadata: result.metadatas[i] as Record<string, string | number>,
     }));
+
+    // Sort newest first (ChromaDB returns insertion order, oldest first)
+    entries.sort((a, b) => b.timestamp - a.timestamp);
+
+    return entries;
   }
 
   /**

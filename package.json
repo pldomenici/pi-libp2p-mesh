@@ -53,6 +53,7 @@
     "test:rigorous": "npx tsx rigorous-concurrent-test.mjs",
     "test:extension": "npx tsx test-extension.mjs",
     "test:fifo": "node test-fifo-queue.mjs",
+    "test:chromadb": "npx tsx test-chromadb-memory.mjs",
     "test:identity": "npx tsx test-identity.mjs",
     "test:leak": "node test-leak.mjs",
     "test:negative": "npx tsx test-negative.mjs",
