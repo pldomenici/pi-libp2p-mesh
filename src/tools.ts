@@ -27,6 +27,7 @@ import type {
   MeshDiscoverResult,
 } from "./types.js";
 import type { MeshProtocols } from "./protocols.js";
+import type { AgentMemory } from "./memory.js";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
 
@@ -65,6 +66,17 @@ let meshProtocols: MeshProtocols | null = null;
  */
 export function setMeshProtocols(protocols: MeshProtocols | null): void {
   meshProtocols = protocols;
+}
+
+/** Module-level reference to the memory store — set by index.ts after session_start. */
+let agentMemory: AgentMemory | null = null;
+
+/**
+ * Wire the active AgentMemory instance so tools can use it.
+ * Called from index.ts after session_start.
+ */
+export function setAgentMemory(memory: AgentMemory | null): void {
+  agentMemory = memory;
 }
 
 // ── Helpers (shared between tools and commands) ──────────────────────────────
@@ -265,6 +277,18 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         const finalResponse = response!;
+
+        // Auto-save outgoing exchange to memory (fire-and-forget — don't block the LLM)
+        if (agentMemory) {
+          agentMemory.store({
+            peerId: params.peerId,
+            key: "exchange",
+            value: `[Sent] ${params.message}\n[Response from ${finalResponse.fromAgent}] ${finalResponse.message}`,
+            metadata: { type: "conversation_turn" },
+          }).catch(() => {
+            // Silently skip — mesh continues normally
+          });
+        }
 
         onUpdate?.({
           content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
@@ -481,6 +505,320 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         content: [{ type: "text", text }],
         details: { removed, before, after, connected },
       };
+    },
+  });
+}
+
+// ── Memory Tool Registration ────────────────────────────────────────────────
+
+/**
+ * Register four memory tools on the pi extension API:
+ *   memory_store   — save a key-value memory entry for a peer
+ *   memory_recall  — recall memories by peer and/or key
+ *   memory_search  — semantic search across stored memories
+ *   memory_keys    — list keys stored for a peer
+ */
+export function registerMemoryTools(pi: ExtensionAPI, _store: MeshStore): void {
+  // ── memory_store ───────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "memory_store",
+    label: "Store Memory",
+    description:
+      "Save a key-value memory entry associated with a specific peer. " +
+      "Use this to remember facts, decisions, preferences, or context about peers. " +
+      "Each call appends a new entry — nothing is overwritten. See AGENT-MEMORY.md for usage patterns.",
+    promptSnippet: "Save a key-value memory entry for a peer",
+    promptGuidelines: [
+      "Use memory_store to remember facts, decisions, preferences, or context about peers. " +
+        "Save key information after each meaningful conversation turn — especially when a peer " +
+        "shares preferences, makes decisions, or provides important context. " +
+        "See AGENT-MEMORY.md for usage patterns and anti-patterns.",
+    ],
+    parameters: Type.Object({
+      peerId: Type.String({ description: "Peer this memory is about" }),
+      key: Type.String({
+        description:
+          'Category/name (e.g., "project_context", "prefs", "decision"). Use short, semantic, reusable keys.',
+      }),
+      value: Type.String({ description: "The content to remember" }),
+      metadata: Type.Optional(
+        Type.Record(Type.String(), Type.Union([Type.String(), Type.Number()])),
+      ),
+    }),
+
+    async execute(_toolCallId: string, params: any, _signal?: AbortSignal) {
+      if (!agentMemory) {
+        return {
+          content: [
+            { type: "text", text: "Memory is not available. ChromaDB may not be running." } as const,
+          ],
+          details: { stored: false, peerId: "", key: "", error: "memory not available" },
+        };
+      }
+
+      try {
+        await agentMemory.store({
+          peerId: params.peerId as string,
+          key: params.key as string,
+          value: params.value as string,
+          metadata: params.metadata as Record<string, string | number> | undefined,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `💾 Stored **${params.key}** for peer ${(params.peerId as string).slice(0, 12)}…`,
+            } as const,
+          ],
+          details: { stored: true, peerId: params.peerId as string, key: params.key as string },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Failed to store memory: ${err.message}` } as const],
+          details: { stored: false, peerId: "", key: "", error: err.message } as any,
+        };
+      }
+    },
+  });
+
+  // ── memory_recall ──────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "memory_recall",
+    label: "Recall Memory",
+    description:
+      "Recall memory entries for a peer by key. At least one of peerId or key is required. " +
+      "Returns entries newest first. Values are truncated unless fullText=true. " +
+      "Auto-retrieve already injects the latest exchange + 3 search results on incoming messages.",
+    promptSnippet: "Recall memories for a peer by key",
+    promptGuidelines: [
+      "Use memory_recall when preparing to interact with a peer to check what you already know about them. " +
+        "Use mesh_list_peers first to get active peer IDs. " +
+        "Auto-retrieve already injects the latest exchange + 3 search results, " +
+        "so use this for deeper context or specific key lookups.",
+    ],
+    parameters: Type.Object({
+      peerId: Type.Optional(
+        Type.String({ description: "Filter by peer (required if key is omitted)" }),
+      ),
+      key: Type.Optional(
+        Type.String({ description: "Filter by key (required if peerId is omitted)" }),
+      ),
+      limit: Type.Optional(
+        Type.Number({ description: "Max results (default 10, hard max 50)" }),
+      ),
+      fullText: Type.Optional(
+        Type.Boolean({
+          description: "Return full untruncated values (default false)",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId: string, params: any, _signal?: AbortSignal) {
+      if (!agentMemory) {
+        return {
+          content: [{ type: "text", text: "Memory is not available. ChromaDB may not be running." } as const],
+          details: { entries: [] as any[], count: 0, error: "memory not available" } as any,
+        };
+      }
+
+      if (!params.peerId && !params.key) {
+        return {
+          content: [{ type: "text", text: "At least one of peerId or key is required for memory_recall." } as const],
+          details: { entries: [] as any[], count: 0, error: "missing filter" } as any,
+        };
+      }
+
+      try {
+        const entries = await agentMemory.get(
+          params.peerId as string | undefined,
+          params.key as string | undefined,
+          { limit: params.limit as number | undefined, fullText: params.fullText as boolean | undefined },
+        );
+
+        if (entries.length === 0) {
+          const scope = params.peerId
+            ? `peer ${(params.peerId as string).slice(0, 12)}…`
+            : `key "${params.key}"`;
+          return {
+            content: [{ type: "text", text: `No memories found for ${scope}.` } as const],
+            details: { entries: [] as any[], count: 0 } as any,
+          };
+        }
+
+        const peerLabel = params.peerId
+          ? `peer ${(params.peerId as string).slice(0, 12)}…`
+          : "all peers";
+        const keyLabel = params.key ? ` key "${params.key}"` : "";
+        const lines = entries.map((e) => {
+          const age = Math.round((Date.now() - e.timestamp) / 60_000);
+          const ageStr = age < 1 ? "just now" : age < 60 ? `${age}m ago` : `${Math.round(age / 60)}h ago`;
+          return `🔑 **${e.key}** (${ageStr})\n${e.value}\n`;
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `**Memories for ${peerLabel}${keyLabel} (${entries.length} entries):**\n\n` +
+                lines.join("\n"),
+            } as const,
+          ],
+          details: { entries, count: entries.length } as any,
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Failed to recall memories: ${err.message}` } as const],
+          details: { entries: [] as any[], count: 0, error: err.message } as any,
+        };
+      }
+    },
+  });
+
+  // ── memory_search ──────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "memory_search",
+    label: "Search Memory",
+    description:
+      "Semantic search across all stored memories. Finds entries by meaning, not just keywords. " +
+      "Optionally scope to a specific peer. Results are filtered by a distance threshold " +
+      "(default 0.6) — only meaningfully similar entries are returned.",
+    promptSnippet: "Semantic search across all stored memories",
+    promptGuidelines: [
+      "Use memory_search to find relevant past conversations by meaning rather than by exact key. " +
+        'Best for cross-cutting queries like "what decisions have we made about performance?"',
+    ],
+    parameters: Type.Object({
+      query: Type.String({ description: "Natural language search query" }),
+      peerId: Type.Optional(
+        Type.String({ description: "Optional: scope to a specific peer" }),
+      ),
+      nResults: Type.Optional(
+        Type.Number({ description: "Max results (default 5)" }),
+      ),
+      fullText: Type.Optional(
+        Type.Boolean({
+          description: "Return full untruncated values (default false)",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId: string, params: any, _signal?: AbortSignal) {
+      if (!agentMemory) {
+        return {
+          content: [{ type: "text", text: "Memory is not available. ChromaDB may not be running." } as const],
+          details: { results: [], count: 0, error: "memory not available" },
+        };
+      }
+
+      try {
+        const results = await agentMemory.search(params.query as string, {
+          peerId: params.peerId as string | undefined,
+          nResults: params.nResults as number | undefined,
+          fullText: params.fullText as boolean | undefined,
+        });
+
+        if (results.length === 0) {
+          // Check total entries for this peer to give helpful context
+          const totalCount = params.peerId
+            ? await agentMemory.count(params.peerId as string).catch(() => 0)
+            : 0;
+          const hint =
+            totalCount > 0
+              ? ` (${totalCount} total ${totalCount === 1 ? "entry exists" : "entries exist"} but none were semantically close enough — try a more specific query)`
+              : "";
+          return {
+            content: [{ type: "text", text: `No memories found similar to "${params.query}".${hint}` } as const],
+            details: { results: [], count: 0 },
+          };
+        }
+
+        const lines = results.map((r, i) => {
+          const age = Math.round((Date.now() - r.timestamp) / 60_000);
+          const ageStr =
+            age < 1 ? "just now" : age < 60 ? `${age}m ago` : `${Math.round(age / 60)}h ago`;
+          const distIcon = r.distance < 0.3 ? "🟢" : r.distance < 0.5 ? "🟡" : "🟠";
+          return `${i + 1}. ${distIcon} **${r.key}** (distance: ${r.distance.toFixed(2)}) — ${ageStr}\n   ${r.value}\n`;
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `**${results.length} memories similar to "${params.query}":**\n\n` +
+                lines.join("\n"),
+            } as const,
+          ],
+          details: { results, count: results.length },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Failed to search memories: ${err.message}` } as const],
+          details: { results: [] as any[], count: 0, error: err.message } as any,
+        };
+      }
+    },
+  });
+
+  // ── memory_keys ────────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "memory_keys",
+    label: "List Memory Keys",
+    description:
+      "List all keys stored for a specific peer, with entry counts. " +
+      "Use this to discover what categories of information are available before recalling.",
+    promptSnippet: "List memory keys for a peer",
+    promptGuidelines: [
+      "Use memory_keys to discover what categories of information you've stored about a peer before recalling specific entries.",
+    ],
+    parameters: Type.Object({
+      peerId: Type.String({ description: "Peer to list keys for" }),
+    }),
+
+    async execute(_toolCallId: string, params: any, _signal?: AbortSignal) {
+      if (!agentMemory) {
+        return {
+          content: [{ type: "text", text: "Memory is not available. ChromaDB may not be running." } as const],
+          details: { keys: [] as any[], count: 0, totalEntries: 0, error: "memory not available" } as any,
+        };
+      }
+
+      try {
+        const keys = await agentMemory.getKeys(params.peerId as string);
+
+        if (keys.length === 0) {
+          return {
+            content: [
+              { type: "text", text: `No keys stored for peer ${(params.peerId as string).slice(0, 12)}….` } as const,
+            ],
+            details: { keys: [] as any[], count: 0, totalEntries: 0 } as any,
+          };
+        }
+
+        const totalEntries = keys.reduce((sum, e) => sum + e.count, 0);
+        const lines = keys.map(
+          (e) => `  🔑 **${e.key}** (${e.count} ${e.count === 1 ? "entry" : "entries"})`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `**Keys for ${(params.peerId as string).slice(0, 12)}… (${totalEntries} total entries):**\n\n` +
+                lines.join("\n"),
+            } as const,
+          ],
+          details: { keys, count: keys.length, totalEntries } as any,
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Failed to list keys: ${err.message}` } as const],
+          details: { keys: [] as any[], count: 0, totalEntries: 0, error: err.message } as any,
+        };
+      }
     },
   });
 }

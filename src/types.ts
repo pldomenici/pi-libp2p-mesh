@@ -111,6 +111,10 @@ export interface MeshConfig {
    * an XSalsa20 stream cipher — peers without the key cannot communicate.
    */
   swarmKeyPath?: string;
+  /** ChromaDB server hostname (default: localhost) */
+  chromaHost?: string;
+  /** ChromaDB server port (default: 8000) */
+  chromaPort?: number;
 }
 
 /** Default configuration */
@@ -119,6 +123,8 @@ export const DEFAULT_CONFIG: Partial<MeshConfig> = {
   enableDht: false,
   gossipTopic: "pi-broadcast",
   listenPorts: { tcp: 0, ws: 0 },
+  chromaHost: "localhost",
+  chromaPort: 8000,
 };
 
 // ── Node State ───────────────────────────────────────────────────────────────
@@ -151,4 +157,77 @@ export interface MeshBroadcastResult {
 export interface MeshDiscoverResult {
   peersFound: number;
   peers: MeshPeer[];
+}
+
+// ── Memory (ChromaDB) ───────────────────────────────────────────────────────
+
+/** Configuration for memory read-side limits. Set via presets or individual flags. */
+export interface MemoryConfig {
+  /** Truncate entry values to this many chars before returning (default: 10,000) */
+  valueTruncationChars: number;
+  /** Hard max entries returned by get()/getByPeer() (default: 50) */
+  maxEntries: number;
+  /** Default limit when LLM omits it (default: 10) */
+  defaultLimit: number;
+  /** Most recent exchange truncated to this on auto-retrieve (default: 5,000) */
+  exchangeTruncationChars: number;
+  /** Max total chars injected by auto-retrieve hook (default: 50,000) */
+  contextBudgetChars: number;
+  /** Discard search results with distance above this (default: 0.6) */
+  distanceThreshold: number;
+  /** Default nResults for semantic search (default: 5) */
+  searchNResults: number;
+}
+
+/** Preset memory configs for different context window sizes. */
+export const MEMORY_PRESETS: Record<"small" | "medium" | "large", MemoryConfig> = {
+  small: {
+    valueTruncationChars: 2_000,
+    maxEntries: 20,
+    defaultLimit: 5,
+    exchangeTruncationChars: 2_000,
+    contextBudgetChars: 12_000,
+    distanceThreshold: 0.6,
+    searchNResults: 3,
+  },
+  medium: {
+    valueTruncationChars: 5_000,
+    maxEntries: 30,
+    defaultLimit: 10,
+    exchangeTruncationChars: 3_000,
+    contextBudgetChars: 25_000,
+    distanceThreshold: 0.6,
+    searchNResults: 5,
+  },
+  large: {
+    valueTruncationChars: 10_000,
+    maxEntries: 50,
+    defaultLimit: 10,
+    exchangeTruncationChars: 5_000,
+    contextBudgetChars: 50_000,
+    distanceThreshold: 0.6,
+    searchNResults: 5,
+  },
+};
+
+/** A single memory entry stored in ChromaDB. */
+export interface MemoryEntry {
+  id: string;
+  peerId: string;
+  key: string;
+  value: string;
+  timestamp: number;
+  type?: string;
+  metadata?: Record<string, string | number>;
+}
+
+/** A memory entry returned by semantic search, including the cosine distance. */
+export interface MemorySearchResult extends MemoryEntry {
+  distance: number;
+}
+
+/** Key list entry returned by getKeys(). */
+export interface MemoryKeyEntry {
+  key: string;
+  count: number;
 }

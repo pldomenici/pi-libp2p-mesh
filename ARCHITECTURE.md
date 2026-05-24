@@ -1,8 +1,8 @@
 # pi-libp2p-mesh — Architecture
 
-> **Last updated:** 2026-05-23  
-> **Package:** `@earendil-works/pi-libp2p-mesh` v0.3.0  
-> **Lines of code:** ~1,680 TypeScript across 5 source files
+> **Last updated:** 2026-05-24  
+> **Package:** `pi-libp2p-mesh` v0.3.0  
+> **Lines of code:** ~1,680 TypeScript across 5 source files (pre-memory), ~2,200 including memory module
 
 ---
 
@@ -15,11 +15,14 @@
    - [node.ts — MeshNode (libp2p Node)](#nodets--meshnode-libp2p-node)
    - [protocols.ts — MeshProtocols (Messaging)](#protocolsts--meshprotocols-messaging)
    - [tools.ts — LLM Tools](#toolsts--llm-tools)
+   - [memory.ts — AgentMemory (ChromaDB)](#memoryts--agentmemory-chromadb)
    - [types.ts — Shared Types](#typests--shared-types)
 4. [Data Flow](#data-flow)
    - [Direct Message Flow (`mesh_send`)](#direct-message-flow-mesh_send)
    - [Broadcast Flow (`mesh_broadcast`)](#broadcast-flow-mesh_broadcast)
    - [LLM Request Queue (FIFO)](#llm-request-queue-fifo)
+   - [Memory Persistence Flow](#memory-persistence-flow)
+   - [Memory Retrieval Flow](#memory-retrieval-flow)
 5. [Protocol Stack](#protocol-stack)
 6. [Lifecycle](#lifecycle)
 7. [State Management](#state-management)
@@ -28,7 +31,9 @@
 10. [Commands](#commands)
 11. [Test Suite](#test-suite)
 12. [Extension Integration](#extension-integration)
-13. [Future Considerations](#future-considerations)
+13. [ChromaDB Memory Layer](#chromadb-memory-layer)
+14. [AGENT-MEMORY.md — LLM Usage Guide](#agent-memorymd--llm-usage-guide)
+15. [Future Considerations](#future-considerations)
 
 ---
 
@@ -40,7 +45,8 @@
 - **Direct agent-to-agent messaging** over a custom libp2p stream protocol (`/pi-agent/0.1.0`)
 - **GossipSub broadcast** for group announcements and coordination
 - **End-to-end encryption** via the Noise protocol
-- **Five LLM-callable tools** for the agent to orchestrate P2P workflows
+- **Nine LLM-callable tools** (5 mesh + 4 memory) for the agent to orchestrate P2P workflows and persistent recall
+- **Persistent agent memory** via ChromaDB — vector-backed storage of peer interactions, key-value facts, and semantic recall
 
 The extension runs as a singleton within each pi agent process. Every agent that loads this extension becomes a mesh peer with a unique Ed25519-based PeerId.
 
@@ -49,50 +55,71 @@ The extension runs as a singleton within each pi agent process. Every agent that
 ## High-Level Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                     pi agent process                      │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │            pi-libp2p-mesh extension                 │  │
-│  │                                                     │  │
-│  │  ┌───────────────┐    ┌────────────────┐            │  │
-│  │  │   index.ts    │◄──►│   tools.ts     │            │  │
-│  │  │  (lifecycle,  │    │  (5 LLM tools, │            │  │
-│  │  │   FIFO queue, │    │   peer store,  │            │  │
-│  │  │   event bus,  │    │   pruning)     │            │  │
-│  │  │   commands)   │    └───────┬────────┘            │  │
-│  │  └───────┬───────┘           │                      │  │
-│  │          │            ┌──────▼────────┐             │  │
-│  │          └───────────►│ MeshProtocols │             │  │
-│  │                       │  · sendMessage│             │  │
-│  │                       │  · broadcast  │             │  │
-│  │                       │  · gossip sub |             │  │
-│  │                       └──────┬─────── ┘             │  │
-│  │                              │                      │  │
-│  │                       ┌──────▼────────┐             │  │
-│  │                       │   MeshNode    │             │  │
-│  │                       │  · libp2p     │             │  │
-│  │                       │  · transports │             │  │
-│  │                       │  · discovery  │             │  │
-│  │                       │  · peer store │             │  │
-│  │                       └───────────────              │  │
-│  └─────────────────────────────────────────────────────┘  │
-│                         │                                 │
-│              ┌──────────┴──────────┐                      │
-│              │   libp2p overlay    │                      │
-│              │  TCP + WebSocket    │                      │
-│              │  Noise / Yamux      │                      │
-│              │  mDNS + DHT         │                      │
-│              └─────────────────────┘                      │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                         pi agent process                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │              pi-libp2p-mesh extension                       │  │
+│  │                                                             │  │
+│  │  ┌───────────────┐    ┌────────────────┐                    │  │
+│  │  │   index.ts    │◄──►│   tools.ts     │                    │  │
+│  │  │  (lifecycle,  │    │  (8 LLM tools, │                    │  │
+│  │  │   FIFO queue, │    │   peer store,  │                    │  │
+│  │  │   event bus,  │    │   pruning,     │                    │  │
+│  │  │   commands,   │    │   memory tools)│                    │  │
+│  │  │   memory hooks│    └───────┬────────┘                    │  │
+│  │  └───────┬───────┘           │                              │  │
+│  │          │            ┌──────▼────────┐                     │  │
+│  │          ├───────────►│ MeshProtocols │                     │  │
+│  │          │            │  · sendMessage│                     │  │
+│  │          │            │  · broadcast  │                     │  │
+│  │          │            │  · gossip sub │                     │  │
+│  │          │            └──────┬────────┘                     │  │
+│  │          │                   │                               │  │
+│  │          │            ┌──────▼────────┐                     │  │
+│  │          │            │   MeshNode    │                     │  │
+│  │          │            │  · libp2p     │                     │  │
+│  │          │            │  · transports │                     │  │
+│  │          │            │  · discovery  │                     │  │
+│  │          │            │  · peer store │                     │  │
+│  │          │            └───────────────┘                     │  │
+│  │          │                                                  │  │
+│  │     ┌────▼─────────┐                                        │  │
+│  │     │  memory.ts   │                                        │  │
+│  │     │ · AgentMemory│                                        │  │
+│  │     │ · store()    │                                        │  │
+│  │     │ · retrieve() │                                        │  │
+│  │     │ · search()   │                                        │  │
+│  │     └──────┬───────┘                                        │  │
+│  │            │                                                │  │
+│  └────────────┼────────────────────────────────────────────────┘  │
+│               │                                                   │
+│  ┌────────────┴───────────────┐                                   │
+│  │      ChromaDB Server       │                                   │
+│  │   (localhost:8000, .chroma)│                                   │
+│  │                            │                                   │
+│  │  Collection: pi_memory_*   │                                   │
+│  │   · peerId → metadata      │                                   │
+│  │   · key → metadata         │                                   │
+│  │   · value → document (embed)│                                  │
+│  └────────────────────────────┘                                   │
+│                                                                   │
+│              ┌──────────┴──────────┐                              │
+│              │   libp2p overlay    │                              │
+│              │  TCP + WebSocket    │                              │
+│              │  Noise / Yamux      │                              │
+│              │  mDNS + DHT         │                              │
+│              └─────────────────────┘                              │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### Dependency Graph
 
 ```
 index.ts
-  ├── node.ts ───────── types.ts
-  ├── protocols.ts ──── types.ts
-  └── tools.ts ──────── types.ts, protocols.ts (type only)
+  ├── node.ts ────────── types.ts
+  ├── protocols.ts ───── types.ts
+  ├── tools.ts ───────── types.ts, protocols.ts (type only), memory.ts (type only)
+  └── memory.ts ──────── types.ts (type only)
 ```
 
 ---
@@ -106,18 +133,21 @@ index.ts
 
 **Responsibilities:**
 
-1. **CLI Flag Registration** — registers `--agent-name`, `--mesh-enable-dht`, `--mesh-gossip-topic`
+1. **CLI Flag Registration** — registers `--agent-name`, `--mesh-enable-dht`, `--mesh-gossip-topic`, `--mesh-chroma-host`, `--mesh-chroma-port`, `--mesh-memory-preset`, `--mesh-memory-max-entries`, `--mesh-memory-truncate`, `--mesh-memory-budget`, `--mesh-memory-exchange-truncate`, `--mesh-memory-distance`
 2. **`session_start` handler** — the boot sequence:
    - Resolves agent name (CLI flag → `PI_MESH_NAME` env var → `PI_COMM_NAME` env var → `pi-<hostname>`)
    - Creates `MeshNode` (libp2p node)
    - Creates `MeshProtocols` (message handler)
+   - **NEW: Initializes `AgentMemory`** — connects to ChromaDB, gets/creates `pi_memory_{agentName}` collection
    - Sets up the **FIFO LLM request queue** (see [LLM Request Queue](#llm-request-queue-fifo))
+   - **NEW: Injects memory context** into incoming requests (auto-retrieves relevant memories about the requesting peer)
+   - **NEW: Saves memory** after LLM responds (auto-saves exchanges)
    - Wires event handlers (peer discovery, connect, disconnect, identify, message, broadcast)
    - Wires inbound broadcasts to `pi.sendUserMessage()` so the LLM sees them
    - Starts background stale-peer pruning (every 30s)
-3. **`session_shutdown` handler** — stops the node, cancels pruning timer, tears down protocols
+3. **`session_shutdown` handler** — stops the node, cancels pruning timer, tears down protocols, closes ChromaDB connection
 4. **Command Registration** — `/mesh-auto-reply`, `/mesh-list-peers`, `/mesh-discover`, `/mesh-prune`
-5. **Delegates tool registration** to `registerMeshTools()` in `tools.ts`
+5. **Delegates tool registration** to `registerMeshTools()` in `tools.ts` and `registerMemoryTools()` in `tools.ts`
 
 **Singleton state:**
 
@@ -125,8 +155,59 @@ index.ts
 |---|---|---|
 | `meshNode` | `MeshNode \| null` | Active libp2p node |
 | `meshProtocols` | `MeshProtocols \| null` | Active protocol handler |
+| `agentMemory` | `AgentMemory \| null` | Active ChromaDB-backed memory store |
 | `pruneInterval` | `setInterval` handle | Background pruning timer |
 | `store` | `MeshStore` | Shared peer registry, broadcast history, agent name, auto-reply flag |
+
+**Memory integration hooks (NEW):**
+
+```
+session_start:
+  // Resolve memory config: preset → individual overrides → defaults
+  // Priority: CLI flag > env var > preset default
+  // Example: --mesh-memory-preset medium --mesh-memory-budget 50000
+  //   → medium preset values for all limits, except budget=50000
+  const memoryConfig = resolveMemoryConfig(pi);
+
+  1. agentMemory = await AgentMemory.create({
+       host, port, 
+       agentName: store.agentName,
+       config: memoryConfig
+     })
+     → If ChromaDB is unreachable at startup:
+        - Log a warning: "ChromaDB unreachable — memory disabled for this session"
+        - agentMemory is set to null
+        - Mesh operates normally; auto-save/auto-retrieve are no-ops
+        - Memory tools return "Memory not available" errors
+        - The agent can still use all mesh tools
+     → If connected: gets/creates pi_memory_{agentName} collection
+     → all read-side limits come from memoryConfig
+
+turn_end (FIFO queue → after extractResponseText):
+  2. if (agentMemory) {
+       try {
+         await agentMemory.store({...});
+       } catch (e) {
+         console.debug('[mesh-memory] auto-save failed:', e.message);
+         // Silently skip — mesh continues normally
+       }
+     }
+
+onRequest (meshProtocols.onRequest handler → before enqueue):
+  3. if (agentMemory) {
+       const memories = await agentMemory.search({...})
+       if (memories.length > 0):
+         prepend `[Memory: ${peer.agentName}]\n` to the user message
+     }
+
+onBroadcast:
+  5. await agentMemory.store({
+       peerId: msg.fromPeerId,
+       key: "broadcast",
+       value: `[${msg.type}] ${msg.message}`,
+       metadata: { type: "broadcast" }
+     })
+```
 
 ---
 
@@ -181,8 +262,6 @@ class MeshNode {
 - `peer:disconnected` — a transport connection was dropped
 - `peer:identified` — the peer's Identify protocol completed (agent name available)
 
-> **Note:** The `MeshNodeEvent` union type also includes `message` and `broadcast` event variants, but `MeshNode` itself never emits them. These event types are defined for future integration between `MeshNode` and `MeshProtocols`. Currently, message and broadcast events flow through `MeshProtocols` callbacks (`onMessage`, `onBroadcast`) directly to the extension layer.
-
 ---
 
 ### protocols.ts — MeshProtocols (Messaging)
@@ -201,18 +280,13 @@ class MeshNode {
 
 ```typescript
 class MeshProtocols {
-  // Send a direct message to a peer, await their response
   sendMessage(peerId: string, request: Omit<AgentRequest, 'fromPeerId' | 'timestamp'>): Promise<AgentResponse>;
-
-  // Publish a broadcast to all peers
   broadcast(message: Omit<BroadcastMessage, 'fromPeerId' | 'timestamp'>): Promise<MeshBroadcastResult>;
 
-  // Callbacks — set by index.ts
   onMessage: (peerId: string, request: AgentRequest) => void;
   onBroadcast: (msg: BroadcastMessage) => void;
   onRequest: (peerId: string, request: AgentRequest) => Promise<string>;
 
-  // Lifecycle
   stop(): Promise<void>;
 }
 ```
@@ -257,11 +331,11 @@ autoReply === true?
 ### tools.ts — LLM Tools
 
 **Path:** `src/tools.ts`  
-**Exports:** `registerMeshTools`, `setMeshProtocols`, `listPeers`, `pruneAllDisconnected`, `pruneStalePeers`, `recordBroadcast`, `MeshStore`, `PeerListResult`
+**Exports:** `registerMeshTools`, `registerMemoryTools`, `setMeshProtocols`, `setAgentMemory`, `listPeers`, `pruneAllDisconnected`, `pruneStalePeers`, `recordBroadcast`, `MeshStore`, `PeerListResult`
 
-**Role:** Registers the five custom tools that the LLM can invoke, and manages the shared `MeshStore` state.
+**Role:** Registers the LLM-callable tools and manages the shared `MeshStore` state.
 
-**Five LLM Tools:**
+#### Mesh Tools (existing — 5 tools)
 
 | Tool | Description | Parameters |
 |---|---|---|
@@ -270,6 +344,15 @@ autoReply === true?
 | `mesh_broadcast` | Publish a GossipSub broadcast | `message: string`, `type?: "announce" \| "query" \| "response" \| "event"` |
 | `mesh_discover` | Scan for new peers, report recently discovered | `{}` |
 | `mesh_prune` | Remove all disconnected/stale peers | `{}` |
+
+#### Memory Tools (NEW — 4 tools)
+
+| Tool | Description | Parameters |
+|---|---|---|
+| `memory_store` | Save a key-value memory entry associated with a peer | `peerId: string`, `key: string`, `value: string`, `metadata?: object` |
+| `memory_recall` | Recall memories for a peer by key (at least one of peerId or key required) | `peerId?: string`, `key?: string`, `limit?: number` |
+| `memory_search` | Semantic search across all stored memories | `query: string`, `peerId?: string`, `nResults?: number` |
+| `memory_keys` | List all keys stored for a peer, with entry counts | `peerId: string` |
 
 All tools use TypeBox schemas for parameter validation. Tools that require a network call (`mesh_send`, `mesh_broadcast`) provide progress updates via the `onUpdate` callback.
 
@@ -295,6 +378,259 @@ interface MeshStore {
 
 ---
 
+### memory.ts — AgentMemory (ChromaDB)
+
+**Path:** `src/memory.ts` (NEW)  
+**Exports:** `AgentMemory` class, `MemoryEntry` type, `MemorySearchResult` type
+
+**Role:** ChromaDB-backed persistent memory store for agent context. Each memory entry is a `(peerId, key) → value` mapping stored as a vector embedding document with rich metadata. Enables semantic recall of past interactions, shared facts, and agent-learned knowledge.
+
+**Data model — ChromaDB document structure**
+
+Each memory entry is stored as a ChromaDB document with:
+
+| Field | ChromaDB location | Type | Description |
+|---|---|---|---|
+| `id` | `ids[]` | `string` | Unique: `{peerId}:{key}:{timestamp}:{uuid4}` |
+| `value` (embedding) | `documents[]` | `string` | The full text — this is what gets vector-embedded for semantic search |
+| `peerId` | `metadatas[].peerId` | `string` | Peer this memory is associated with |
+| `agentName` | `metadatas[].agentName` | `string` | Our own agent name (for per-agent collection scoping) |
+| `key` | `metadatas[].key` | `string` | User-defined key (e.g., `"prefs"`, `"project_context"`, `"exchange"`) |
+| `timestamp` | `metadatas[].timestamp` | `number` | Epoch ms when stored |
+| `type` | `metadatas[].type` | `string` | Category: `"explicit"`, `"conversation_turn"`, `"broadcast"`, `"system"` |
+
+**Collection strategy:**
+- One collection per agent: `pi_memory_{agentName}` 
+- All memories share the same collection; filtered by metadata `peerId` and `key`
+- Rationale: clean isolation per agent instance, no cross-contamination of embedding spaces
+
+**API:**
+
+```typescript
+class AgentMemory {
+  readonly agentName: string;
+  readonly collectionName: string;  // "pi_memory_{agentName}"
+
+  // Factory
+  static create(opts: {
+    host?: string;
+    port?: number;
+    agentName: string;
+    config?: MemoryConfig;
+  }): Promise<AgentMemory>;
+
+  // ── Core Operations ────────────────────────────────────────────────
+
+  /**
+   * Store a memory entry. Every call appends a new entry — entries accumulate
+   * as a full chronological log of all interactions during the run.
+   * The same (peerId, key) pair can have multiple entries over time.
+   */
+  store(entry: {
+    peerId: string;
+    key: string;
+    value: string;
+    metadata?: Record<string, string | number>;
+  }): Promise<void>;
+
+  /**
+   * Get memory entries for (peerId, key), newest first.
+   * Values are truncated to 10,000 chars unless fullText=true.
+   * Hard max: 50 entries regardless of limit.
+   */
+  get(peerId: string, key: string, opts?: {
+    limit?: number;
+    fullText?: boolean;
+  }): Promise<MemoryEntry[]>;
+
+  /**
+   * Get all memories for a peer, all keys, newest first.
+   * Values truncated to 10,000 chars. Hard max: 50 entries.
+   */
+  getByPeer(peerId: string, limit?: number): Promise<MemoryEntry[]>;
+
+  /**
+   * Semantic search. Values truncated to 10,000 chars.
+   * Entries with distance > 0.6 are filtered out.
+   */
+  search(query: string, opts?: {
+    peerId?: string;
+    nResults?: number;
+    fullText?: boolean;
+  }): Promise<MemorySearchResult[]>;
+
+  /**
+   * Delete all memories associated with a specific peer.
+   */
+  deleteByPeer(peerId: string): Promise<number>;
+
+  /**
+   * Delete a specific memory entry by its ChromaDB document ID.
+   */
+  deleteById(id: string): Promise<void>;
+
+  /**
+   * Return the count of stored memories, optionally scoped to a peer.
+   */
+  count(peerId?: string): Promise<number>;
+
+  /**
+   * List all unique keys stored for a peer, with entry counts.
+   */
+  getKeys(peerId: string): Promise<Array<{ key: string; count: number }>>;
+
+  // ── Lifecycle ──────────────────────────────────────────────────────
+
+  /** Close the ChromaDB connection. */
+  stop(): Promise<void>;
+}
+
+interface MemoryEntry {
+  id: string;          // ChromaDB document ID
+  peerId: string;
+  key: string;
+  value: string;
+  timestamp: number;
+  type?: string;
+  metadata?: Record<string, string | number>;
+}
+
+interface MemorySearchResult extends MemoryEntry {
+  distance: number;    // Cosine distance — lower = more similar
+}
+```
+
+**Memory configuration (`MemoryConfig`):**
+
+All read-side limits are configurable via the `MemoryConfig` object passed to `AgentMemory.create()`. These come from CLI flags, environment variables, or the preset system.
+
+```typescript
+interface MemoryConfig {
+  /** Truncate entry values to this many chars (default: 10,000) */
+  valueTruncationChars: number;
+
+  /** Hard max entries returned by get()/getByPeer() (default: 50) */
+  maxEntries: number;
+
+  /** Default limit when LLM omits it (default: 10) */
+  defaultLimit: number;
+
+  /** Most recent exchange truncated to this (default: 5,000) */
+  exchangeTruncationChars: number;
+
+  /** Max total chars injected by auto-retrieve hook (default: 50,000) */
+  contextBudgetChars: number;
+
+  /** Discard search results with distance above this (default: 0.6) */
+  distanceThreshold: number;
+
+  /** Default nResults for semantic search (default: 5) */
+  searchNResults: number;
+}
+```
+
+**Presets — set all limits in one flag:**
+
+| Preset | Target model | Truncation | Max entries | Budget | Exchange |
+|---|---|---|---|---|---|
+| `"small"` | 32K tokens | 2,000 | 20 | 12,000 | 2,000 |
+| `"medium"` | 128K tokens | 5,000 | 30 | 25,000 | 3,000 |
+| `"large"` (default) | 1M tokens | 10,000 | 50 | 50,000 | 5,000 |
+
+Presets are applied by passing `--mesh-memory-preset small` (CLI) or `PI_MEMORY_PRESET=small` (env). Individual flags override specific preset values.
+
+**Constructor logic:**
+```typescript
+static async create(opts): Promise<AgentMemory> {
+  const host = opts.host ?? "localhost";
+  const port = opts.port ?? 8000;
+  const agentName = opts.agentName;
+  const config = opts.config ?? PRESETS.large;
+
+  // 1. Initialize the default embedding function (all-MiniLM-L6-v2, local WASM)
+  const embedder = new DefaultEmbeddingFunction();
+
+  // 2. Connect to ChromaDB
+  const client = new ChromaClient({ host, port, ssl: false });
+
+  // 3. Get or create the agent's collection
+  const collectionName = `pi_memory_${agentName}`;
+  const collection = await client.getOrCreateCollection({ 
+    name: collectionName, 
+    embeddingFunction: embedder 
+  });
+
+  return new AgentMemory(client, collection, collectionName, agentName, config);
+}
+```
+
+**Store operation (`memory_store` / auto-save) — ChromaDB calls:**
+```typescript
+async store(entry): Promise<void> {
+  // Append-only: every call generates a unique ID and adds a new entry.
+  // The same (peerId, key) pair can accumulate many entries over a run.
+  const id = `${entry.peerId}:${entry.key}:${Date.now()}:${uuidv4()}`;
+  
+  await this.collection.add({
+    ids: [id],
+    documents: [entry.value],
+    metadatas: [{
+      peerId: entry.peerId,
+      agentName: this.agentName,
+      key: entry.key,
+      timestamp: Date.now(),
+      type: entry.metadata?.type ?? "explicit",
+      ...entry.metadata,
+    }],
+  });
+}
+```
+
+**Semantic search (`memory_search`) — ChromaDB calls:**
+```typescript
+async search(query: string, opts?: { peerId?: string; nResults?: number; fullText?: boolean }): Promise<MemorySearchResult[]> {
+  const n = opts?.nResults ?? this.config.searchNResults;
+  
+  // Query for 2× the requested results so distance filtering doesn't
+  // leave the caller with fewer results than expected
+  const queryN = n * 2;
+  
+  const where: Record<string, string> = {};
+  if (opts?.peerId) where.peerId = opts.peerId;
+
+  const results = await this.collection.query({
+    queryTexts: [query],
+    nResults: queryN,
+    where: Object.keys(where).length > 0 ? where : undefined,
+  });
+
+  // Map ChromaDB result to MemorySearchResult[], filter by distance threshold
+  const mapped: MemorySearchResult[] = [];
+  for (let i = 0; i < results.ids[0].length && mapped.length < n; i++) {
+    const distance = results.distances[0][i];
+    if (distance > this.config.distanceThreshold) continue;
+    mapped.push({
+      id: results.ids[0][i],
+      peerId: results.metadatas[0][i].peerId as string,
+      key: results.metadatas[0][i].key as string,
+      value: this.truncateValue(results.documents[0][i], opts?.fullText),
+      timestamp: results.metadatas[0][i].timestamp as number,
+      type: results.metadatas[0][i].type as string,
+      distance,
+    });
+  }
+  return mapped;
+}
+```
+
+**Embedding function:**
+- Uses `@chroma-core/default-embed` — runs the all-MiniLM-L6-v2 Sentence Transformer locally as WASM
+- No external API keys required; runs entirely offline
+- Embeddings are computed client-side before documents are sent to ChromaDB
+- **Important:** The model has a ~256 token input limit (~400-500 words, ~2,500 chars). Text beyond this is stored but NOT embedded — vector search only considers the first ~2,500 characters of each document. The full truncated text (up to 10,000 chars) is still returned by `memory_recall` for the LLM to read. This means semantic search quality degrades for very long entries; keep `memory_store` values concise for best search results.
+
+---
+
 ### types.ts — Shared Types
 
 **Path:** `src/types.ts`
@@ -307,20 +643,24 @@ Defines all shared TypeScript interfaces and types:
 | `AgentRequest` | `protocol`, `requestId`, `fromAgent`, `fromPeerId`, `timestamp`, `message`, `autoReply?`, `timeoutMs?` |
 | `AgentResponse` | `requestId`, `fromAgent`, `fromPeerId`, `timestamp`, `message`, `error` |
 | `BroadcastMessage` | `fromAgent`, `fromPeerId`, `timestamp`, `message`, `type?` |
-| `MeshConfig` | `agentName`, `listenPorts?`, `enableMdns?`, `enableDht?`, `bootstrapPeers?`, `gossipTopic?`, `announceAddresses?`, `privateKey?`, `swarmKeyPath?` |
+| `MeshConfig` | `agentName`, `listenPorts?`, `enableMdns?`, `enableDht?`, `bootstrapPeers?`, `gossipTopic?`, `announceAddresses?`, `privateKey?`, `swarmKeyPath?`, `chromaHost?`, `chromaPort?`, `memoryPreset?`, `memoryOverrides?` |
 | `MeshNodeEvent` | Union: `peer:discovered`, `peer:connected`, `peer:disconnected`, `peer:identified`, `message`, `broadcast` |
 | `MeshSendResult` | `peerId`, `agentName?`, `response`, `error?` |
 | `MeshBroadcastResult` | `topic`, `peersReached`, `messageId` |
 | `MeshDiscoverResult` | `peersFound`, `peers` |
+| `MemoryEntry` (NEW) | `id`, `peerId`, `key`, `value`, `timestamp`, `type?`, `metadata?` |
+| `MemorySearchResult` (NEW) | extends `MemoryEntry` + `distance: number` |
 
-**Default config:**
+**Default config (updated with ChromaDB defaults):**
 
 ```typescript
 const DEFAULT_CONFIG: Partial<MeshConfig> = {
   enableMdns: true,
   enableDht: false,
   gossipTopic: "pi-broadcast",
-  listenPorts: { tcp: 0, ws: 0 },   // random ports
+  listenPorts: { tcp: 0, ws: 0 },
+  chromaHost: "localhost",
+  chromaPort: 8000,
 };
 ```
 
@@ -374,7 +714,7 @@ const DEFAULT_CONFIG: Partial<MeshConfig> = {
                                     (capped at 200)
 ```
 
-On the receiving side, each peer's `onBroadcast` callback fires, the message is recorded in the shared store, and if `autoReplyAll` is off, forwarded to the LLM via `pi.sendUserMessage()`.
+On the receiving side, each peer's `onBroadcast` callback fires, the message is recorded in the shared store, and if `autoReplyAll` is off, forwarded to the LLM via `pi.sendUserMessage()`. Additionally, the broadcast is stored in ChromaDB memory (see [Memory Persistence Flow](#memory-persistence-flow)).
 
 ### LLM Request Queue (FIFO)
 
@@ -399,13 +739,22 @@ let activeRequest: PendingRequest | null;    // current item being processed by 
 - `REQUEST_TIMEOUT_MS = 60_000`
 - `MAX_QUEUE_SIZE = 50`
 
-**Flow:**
+**Flow (updated with memory retrieval):**
 
 ```
 Incoming request (autoReply: false)
   │
   ├─ autoReplyAll? → YES: auto-echo, no queue
   ├─ queue full?    → YES: reject with "[queue-full]"
+  │
+  ├─ [NEW] Retrieve memories about requesting peer (with read-side safeguards)
+  │    │
+  │    ├─ agentMemory.search({ peerId, query: request.message, nResults: 3 })
+  │    │   → discard results with distance > 0.6
+  │    ├─ agentMemory.get(peerId, "exchange", { limit: 1 })
+  │    │   → truncated to 5,000 chars
+  │    ├─ Aggregate all retrieved text, cap at 50,000 chars total (~12.5K tokens)
+  │    └─ If memories found, prepend memory context to request message
   │
   └─ enqueue: push PendingRequest with Promise + 60s timer
        │
@@ -418,6 +767,8 @@ Incoming request (autoReply: false)
             └─ LLM responds → turn_end fires
                  │
                  ├─ extractResponseText(event.message)
+                 ├─ [NEW] agentMemory.store() — save exchange as memory
+                 │    key="exchange", value=[Request] + [Response]
                  ├─ resolve(activeRequest) → sends response to remote peer
                  ├─ activeRequest = null
                  └─ advanceQueue() → process next in queue
@@ -429,6 +780,91 @@ Incoming request (autoReply: false)
 - Timed-out entries are resolved with `[timeout]` and skipped by `advanceQueue()`
 - Backpressure: queue rejects immediately when at capacity (50 entries)
 - The queue is exercised in `test-fifo-queue.mjs` with 8 test cases covering ordering, capacity, timeout, and cross-talk prevention
+
+### Memory Persistence Flow
+
+```
+LLM interaction with peer
+        │
+        ▼
+   [Auto-save hook in index.ts]
+        │
+   ┌────┴─────────────────────────────┐
+   │ When?                            │
+   │ • After turn_end (conversation)  │
+   │ • After receiving broadcast      │
+   │ • LLM calls memory_store tool    │
+   └────┬─────────────────────────────┘
+        │
+        ▼
+   AgentMemory.store({
+     peerId: "12D3KooW...",
+     key: "exchange",
+     value: "[Request] ...\n[Response] ...",
+     metadata: { type: "conversation_turn" }
+   })
+        │
+        ▼
+   ChromaDB API calls:
+   1. collection.add()
+      → Append new entry with unique ID ({peerId}:{key}:{ts}:{uuid4})
+      → DefaultEmbeddingFunction embeds the `value` text
+      → Metadata: { peerId, agentName, key, timestamp, type }
+```
+
+**ChromaDB call locations in the extension:**
+
+| Location | Trigger | ChromaDB Call(s) |
+|---|---|---|
+| `index.ts` → `session_start` | Agent starts | `new ChromaClient(...)` → `client.getOrCreateCollection()` |
+| `index.ts` → FIFO `turn_end` handler | LLM responds to peer request | `memory.store({ key: "exchange", ... })` → `collection.add()` |
+| `index.ts` → FIFO `onRequest` handler (before enqueue) | Peer sends request | `memory.search({ peerId, query, nResults: 3 })` + `memory.get(peerId, "exchange", 1)` → `collection.query()` + `collection.get()`. Results filtered by distance ≤ 0.6, truncated, capped to 50KB total context budget. |
+| `index.ts` → `onBroadcast` handler | Broadcast received | `memory.store({ key: "broadcast", ... })` → `collection.add()` |
+| `tools.ts` → `memory_store` execute() | LLM explicitly saves | `memory.store(...)` → `collection.add()` |
+| `tools.ts` → `memory_recall` execute() | LLM explicitly recalls | `memory.get(peerId, key, { limit, fullText })` → `collection.get()`. Values truncated to 10,000 chars unless fullText=true. Hard max 50 entries. |
+| `tools.ts` → `memory_search` execute() | LLM semantic search | `memory.search(query, { peerId, nResults, fullText })` → `collection.query()`. Values truncated to 10,000 chars. distance > 0.6 filtered. |
+| `tools.ts` → `memory_keys` execute() | LLM lists keys | `memory.getKeys(peerId)` → `collection.get({ where: { peerId } })` → deduplicate keys, count entries per key. |
+| `index.ts` → `session_shutdown` | Agent stops | (no explicit ChromaDB close needed — client is stateless HTTP) |
+
+### Memory Retrieval Flow
+
+```
+LLM needs context about a peer
+        │
+        ├── Automatic (onRequest handler)
+        │       │
+        │       ▼
+        │   AgentMemory.search({
+        │     peerId: request.fromPeerId,
+        │     query: request.message,
+        │     nResults: 3
+        │   })
+        │       │
+        │       ▼
+        │   ChromaDB: collection.query({ queryTexts, where: { peerId }, nResults })
+        │       │
+        │       ▼
+        │   Prepended to user message:
+        │   → "[Memory about pi-alpha:
+        │       She prefers short answers.
+        │       Last time we discussed project X, we decided on Y.]"
+        │
+        ├── LLM tool: memory_recall
+        │       │
+        │       ▼
+        │   AgentMemory.get(peerId, key)  or  AgentMemory.getByPeer(peerId)
+        │       │
+        │       ▼
+        │   ChromaDB: collection.get({ where: { peerId, key } })
+        │
+        └── LLM tool: memory_search
+                │
+                ▼
+            AgentMemory.search(query, { peerId?, nResults })
+                │
+                ▼
+            ChromaDB: collection.query({ queryTexts, where, nResults })
+```
 
 ---
 
@@ -446,6 +882,7 @@ Incoming request (autoReply: false)
 | **Pub/Sub** | `@chainsafe/libp2p-gossipsub` | Topic-based broadcast messaging |
 | **Private Network** | `@libp2p/pnet` | Optional swarm key (PSK) for private P2P networks — all peers must share the same key |
 | **Custom** | `/pi-agent/0.1.0` (custom protocol) | Direct agent-to-agent CBOR-encoded messaging |
+| **Memory / Vector DB** | `chromadb` + `@chroma-core/default-embed` | Persistent agent memory, semantic search, embedding storage |
 
 **Identity:** Each agent gets an Ed25519 keypair. By default, a new keypair is generated per session, resulting in a new PeerId each time. Passing `config.privateKey` (a 32-byte seed) gives the agent **stable identity** across restarts — the PeerId is deterministically derived from the seed.
 
@@ -459,53 +896,68 @@ pi agent starts
   ├─ Extension loads (index.ts default export)
   │    ├─ register CLI flags
   │    ├─ register commands
-  │    └─ register tools
+  │    └─ register tools (mesh + memory)
   │
   ├─ session_start event
   │    ├─ resolve agentName
-  │    ├─ MeshNode.create(config)     → generate keypair, create libp2p
-  │    ├─ new MeshProtocols(node)     → register /pi-agent/0.1.0, subscribe GossipSub
+  │    ├─ AgentMemory.create(host, port, agentName)
+  │    │    ├─ new DefaultEmbeddingFunction()
+  │    │    ├─ new ChromaClient({ host, port })
+  │    │    ├─ client.getOrCreateCollection("pi_memory_{agentName}")
+  │    │    └─ ready for store/retrieve/search
+  │    ├─ MeshNode.create(config)        → generate keypair, create libp2p
+  │    ├─ new MeshProtocols(node)        → register /pi-agent/0.1.0, subscribe GossipSub
   │    ├─ wire onMessage / onRequest / onBroadcast callbacks
-  │    ├─ register ONE turn_end listener (FIFO queue dequeue)
-  │    ├─ node.start()                → begin listening, discovery
-  │    └─ setInterval(prune, 30_000)  → background stale cleanup
+  │    ├─ register ONE turn_end listener (FIFO queue dequeue + memory save)
+  │    ├─ node.start()                   → begin listening, discovery
+  │    └─ setInterval(prune, 30_000)     → background stale cleanup
   │
-  ├─ Agent runs (LLM can call tools, peers can message each other)
+  ├─ Agent runs
+  │    ├─ LLM can call mesh tools (list_peers, send, broadcast, discover, prune)
+  │    ├─ LLM can call memory tools (store, recall, search)
+  │    ├─ Auto-save: each peer conversation turn is persisted to ChromaDB
+  │    ├─ Auto-retrieve: incoming peer requests get context prepended from memory
+  │    └─ Peers can message each other
   │
   └─ session_shutdown event
        ├─ clear pruning interval
-       ├─ protocols.stop()            → unhandle protocol, unsubscribe topic
-       └─ node.stop()                 → close connections, stop discovery
+       ├─ protocols.stop()               → unhandle protocol, unsubscribe topic
+       ├─ node.stop()                    → close connections, stop discovery
+       └─ agentMemory.stop()             → (no-op, ChromaDB client is stateless)
 ```
 
 ---
 
 ## State Management
 
-**Two peer stores exist:**
+**Three stores exist:**
 
-1. **Node-level** (`node.ts`:`this.peerStore: Map<string, MeshPeer>`)
-   - Populated by libp2p events (peer:discovery, peer:connect, peer:disconnect, peer:identify)
-   - Maintains disconnected peers with timestamps
-   - Queried by `getPeers()`, `pruneStalePeers()`, `pruneAllDisconnected()`
+| Store | Location | Persistence | Content |
+|---|---|---|---|
+| **Node-level peer store** | `node.ts`:`this.peerStore` | In-memory (per session) | Peers discovered via libp2p events |
+| **Extension-level peer store** | `tools.ts`:`store.peers` | In-memory (per session) | Peer registry for tool responses |
+| **Memory store** | `memory.ts`:`AgentMemory.collection` | **Persistent** (ChromaDB `.chroma/`) | Full chronological log of all interactions — conversations, facts, broadcasts — accumulated as append-only entries across the run |
 
-2. **Extension-level** (`tools.ts`:`store.peers: Map<string, MeshPeer>`)
-   - Populated by `handleNodeEvent()` in `index.ts`, which receives events from the node-level store
-   - Used by tools (`mesh_list_peers`, `mesh_discover`, `mesh_prune`) and commands
-   - Pruning operates on this store
+**Why three stores?**
+- **Node store:** Canonical peer state driven by libp2p connection events. Short-lived, tightly coupled to network state.
+- **Extension store:** Tool-facing cache of the node store. Populated from node events, with eventual consistency. Cleared on shutdown.
+- **Memory store:** Persistent, cross-session. Survives agent restarts. Uses vector embeddings for semantic retrieval. Keyed by `(peerId, key)`.
 
-**Why two stores?** The extension store acts as a cache for tool responses. The node store is the canonical source driven by libp2p. The extension store is populated from node events, creating eventual consistency.
+**Memory persistence across sessions:**
+- ChromaDB data is stored on disk at `.chroma/` (configurable via `chroma run --path`)
+- The memory collection persists even when the pi agent restarts
+- On restart, `AgentMemory.create()` reconnects to the existing collection — all memories are immediately available
+- This means the agent "remembers" past conversations across sessions
 
 **Broadcast history:**
-- Capped at `MAX_BROADCAST_HISTORY = 200` entries (M3 fix)
-- Oldest entries evicted when cap is exceeded
-- Populated by both outgoing broadcasts (from `mesh_broadcast` tool) and incoming broadcasts (from GossipSub). Incoming broadcasts are also forwarded to the LLM via `pi.sendUserMessage()`
+- In-memory only, capped at `MAX_BROADCAST_HISTORY = 200` entries
+- Broadcasts are also persisted to ChromaDB memory (key: `"broadcast"`) for longer-term recall
 
 ---
 
 ## Design Decisions & Fixes
 
-These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPORT.md). Items **H1–H4** (high severity) and **M1–M3** (medium severity) were subsequently implemented. Items **L1** (double-pass memory copy in `readStream`) and **L2** (redundant peer iteration in pruning) remain as future optimizations.
+These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPORT.md). Items **H1–H4** (high severity) and **M1–M3** (medium severity) were subsequently implemented.
 
 | Label | Severity | File | Issue | Solution |
 |---|---|---|---|---|
@@ -526,14 +978,46 @@ These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPOR
 | `--agent-name` | string | `pi-<hostname>` | Agent name for the mesh (also from `PI_MESH_NAME` or `PI_COMM_NAME` env var) |
 | `--mesh-enable-dht` | boolean | `false` | Enable Kademlia DHT for wide-area discovery |
 | `--mesh-gossip-topic` | string | `pi-broadcast` | GossipSub topic for broadcast messages |
-| `--mesh-swarm-key` | string | — | Path to a `swarm.key` file for private P2P network (PSK). All peers must share the same key. See [Private Network](#private-network-swarm-key). |
+| `--mesh-swarm-key` | string | — | Path to a `swarm.key` file for private P2P network (PSK). All peers must share the same key. |
+| `--mesh-chroma-host` | string | `localhost` | ChromaDB server hostname (or `CHROMA_HOST` env var) |
+| `--mesh-chroma-port` | number | `8000` | ChromaDB server port (or `CHROMA_PORT` env var) |
+| `--mesh-memory-preset` | string | `large` | Memory limit preset: `small` (32K), `medium` (128K), `large` (1M). Sets all read-side limits at once. |
+| `--mesh-memory-max-entries` | number | — | Override hard max entries (50 for large preset) |
+| `--mesh-memory-truncate` | number | — | Override value truncation in chars (10,000 for large preset) |
+| `--mesh-memory-budget` | number | — | Override auto-retrieve context budget in chars (50,000 for large preset) |
+| `--mesh-memory-exchange-truncate` | number | — | Override exchange truncation in chars (5,000 for large preset) |
+| `--mesh-memory-distance` | float | — | Override distance threshold (0.6 default) |
 
 **Environment variables:**
 - `PI_MESH_NAME` — agent name (overrides default, but CLI flag takes priority)
 - `PI_COMM_NAME` — backward-compatible alias for agent name
 - `PI_SWARM_KEY` — path to a `swarm.key` file (alternative to `--mesh-swarm-key` flag)
+- `CHROMA_HOST` — ChromaDB host (alternative to `--mesh-chroma-host`)
+- `CHROMA_PORT` — ChromaDB port (alternative to `--mesh-chroma-port`)
+- `PI_MEMORY_PRESET` — memory limit preset: `small`, `medium`, `large` (alternative to `--mesh-memory-preset`)
+- `PI_MEMORY_MAX_ENTRIES` — override max entries (alternative to `--mesh-memory-max-entries`)
+- `PI_MEMORY_TRUNCATE` — override truncation chars (alternative to `--mesh-memory-truncate`)
+- `PI_MEMORY_BUDGET` — override context budget chars (alternative to `--mesh-memory-budget`)
 
-**Config priority:** CLI flag → `PI_MESH_NAME` env var → `PI_COMM_NAME` env var → `pi-<hostname>`
+**Config priority:** CLI flag → environment variable → default
+
+**Usage examples:**
+
+```bash
+# Use the "small" preset for a 32K-token model
+pi --mesh-memory-preset small
+
+# Use "medium" preset but double the context budget
+pi --mesh-memory-preset medium --mesh-memory-budget 50000
+
+# Individual overrides without a preset (large defaults apply to remaining)
+pi --mesh-memory-max-entries 100 --mesh-memory-truncate 20000
+
+# Environment variable approach
+export PI_MEMORY_PRESET=small
+export PI_MEMORY_MAX_ENTRIES=100
+pi
+```
 
 ---
 
@@ -561,6 +1045,7 @@ All tests located in the project root (`*.mjs`). Run with `npm test` (requires b
 | Stable Identity | `test-identity.mjs` | 9 tests | Unit | ❌ |
 | Negative/Edge | `test-negative.mjs` | 11 tests | Fuzzing | ✅ (needs peers) |
 | Extension Import | `test-extension.mjs` | 1 test | Smoke | ❌ |
+| **Memory** (NEW) | `test-memory.mjs` | TBD | Unit + Integration | ❌ (needs ChromaDB) |
 
 **Key performance metrics (rigorous test, 4-peer mesh):**
 - Peak throughput: 741–781 msg/s
@@ -594,67 +1079,309 @@ export { default } from './dist/index.js';
 - `@earendil-works/pi-coding-agent` — the pi agent framework providing `ExtensionAPI`
 - `typebox` — JSON schema validation for tool parameters
 
+**Runtime dependencies (NEW):**
+- `chromadb` — ChromaDB JS client (`^3.4.3`)
+- `@chroma-core/default-embed` — Default embedding function (`^0.1.9`)
+
 **Build:** TypeScript compiled to `dist/` (ES2022, NodeNext module resolution, strict mode).
 
 ---
 
-## Private Network (Swarm Key)
+## ChromaDB Memory Layer
 
-`pi-libp2p-mesh` supports **private P2P networks** via a pre-shared key (PSK) using `@libp2p/pnet`. When a swarm key is configured, all libp2p connections are wrapped in an XSalsa20 stream cipher — peers without the key cannot communicate.
+### Overview
 
-### Configuration
+The ChromaDB memory layer gives each pi agent persistent, semantic memory of its interactions. Every conversation turn with a peer, every broadcast received, and every explicit `memory_store` call is stored as a vector-embedded document in ChromaDB. The LLM can later search these memories by semantic similarity (natural language query) or retrieve them by exact `(peerId, key)` lookup.
 
-```bash
-# Via CLI flag
-pi --mesh-swarm-key ./swarm.key
+### Data Model
 
-# Via environment variable
-export PI_SWARM_KEY=./swarm.key
+Each memory entry in ChromaDB:
+
+```typescript
+{
+  id: "12D3KooW...abc:prefs:1716587000000:a1b2c3d4",
+  document: "This agent prefers short, code-only responses with no explanations.",
+  metadata: {
+    peerId: "12D3KooW...abc",
+    agentName: "pi-alpha",     // our own agent name
+    key: "prefs",              // user-defined key
+    timestamp: 1716587000000,
+    type: "explicit"           // "conversation_turn" | "broadcast" | "explicit" | "system"
+  },
+  embedding: [0.0123, -0.0456, ...]  // 384-dim all-MiniLM-L6-v2
+}
 ```
 
-### Swarm Key File Format
+**Key design principles:**
+1. **Embedded on `document` (value)**: The text content is what gets vector-embedded. Metadata is for filtering, not embedding.
+2. **Metadata for scoping**: `peerId` and `key` are metadata fields that ChromaDB can filter on efficiently.
+3. **Append-only log**: Every `store()` call creates a new entry with a unique ID (`{peerId}:{key}:{timestamp}:{uuid4}`). Entries accumulate chronologically — the same `(peerId, key)` pair can have many entries over time, forming a complete interaction log for the duration of the run.
+4. **Persistent across sessions**: Data survives agent restarts because ChromaDB persists to disk.
+5. **Collection per agent**: `pi_memory_{agentName}` keeps each agent's memory isolated.
 
-The key file uses the standard libp2p PSK format (95 bytes):
+### Storage Growth (Append-Only Log)
+
+Since every interaction appends a new entry (never overwrites), storage grows linearly with activity during a run.
+
+| Activity | Entries per event |
+|---|---|
+| Each peer exchange (LLM turn) | 1 entry (key: `"exchange"`) |
+| Each broadcast received | 1 entry (key: `"broadcast"`) |
+| Each explicit `memory_store` call | 1 entry (LLM-defined key) |
+
+**Per-run estimates:**
+
+| Scenario | Peers | Exchanges/peer | Broadcasts | Explicit stores | Total entries |
+|---|---|---|---|---|---|
+| Light (1 peer, brief task) | 1 | 5 | 2 | 3 | **~10** |
+| Typical (3 peers, normal task) | 3 | 10 | 5 | 6 | **~40** |
+| Heavy (5 peers, deep collaboration) | 5 | 20 | 10 | 10 | **~120** |
+| Stress (10 peers, extended session) | 10 | 30 | 15 | 20 | **~335** |
+
+At ~1–4KB per entry (document text + 384-dim embedding + metadata), a typical session consumes **<1MB**. Even stress scenarios stay under ~2MB. ChromaDB can handle millions of entries comfortably, so append-only growth is not a concern for normal use.
+
+Retrieving the *most recent* entries for a given `(peerId, key)` uses `collection.get()` with a `limit` parameter — ChromaDB returns entries sorted by insertion order, so the newest N are always accessible without a full scan.
+
+### Read-Side Analysis
+
+Every read path pulls data back into the LLM's context window. Some paths are bounded, some are not:
+
+#### Read Path 1: Auto-retrieve on incoming request (EVERY peer message)
+
+Triggered automatically in `onRequest` — this is the **hottest path** and the most dangerous:
 
 ```
-/key/swarm/psk/1.0.0/
-/base16/
-<32-byte hex-encoded key>
+memory.search({ peerId, query: request.message, nResults: 3 })   → 3 entries
+memory.get(peerId, "exchange", 1)                                  → 1 entry
 ```
 
-### Generating a Swarm Key
+**Risk:** The most recent exchange entry (`"exchange"`) could be huge — a code review, a long explanation, or a detailed plan easily exceeds 5KB. Plus 3 semantic search results. Every incoming message from a peer burns 4 memory entries into the LLM's system context.
 
-```bash
-# Using libp2p's utility (if available)
-npx libp2p-pnet-key > swarm.key
+| Session age | Exchange count with peer | Search results | Injected into LLM context |
+|---|---|---|---|
+| Early (3 exchanges) | Small entries (~500B each) | 3 short entries | ~2KB — fine |
+| Mid (12 exchanges) | Medium entries (~1KB each) | 3 mixed entries | ~5KB — acceptable |
+| Late (30+ exchanges) | Large entries (2-5KB each) | 3 large entries | **12-20KB** — problematic |
 
-# Or manually: generate 32 random bytes, hex-encode, format as above
+#### Read Path 2: `memory_recall` tool (LLM-triggered)
+
+```
+memory.get(peerId, key, limit)
 ```
 
-### Security Implications
+**Risk:** The `limit` parameter is optional. If `limit` is omitted or set high, the LLM gets EVERY entry for that `(peerId, key)` pair. A peer with 30 `"exchange"` entries at 1-5KB each returns **30-150KB** of text.
 
-- All mesh traffic is encrypted end-to-end by Noise protocol regardless of swarm key.
-- The swarm key adds a **network-level access control** layer: only peers sharing the key can even establish connections.
-- The key is loaded at `MeshNode.create()` time and cannot be changed without restarting the node.
-- A project's `swarm.key` should be kept out of version control (add to `.gitignore`).
+#### Read Path 3: `memory_search` tool (LLM-triggered)
+
+```
+memory.search(query, { peerId?, nResults })
+```
+
+**Risk: LOW** — `nResults` defaults to 5. Bounded and LLM-controlled. 5 × 1-5KB = 5-25KB, manageable.
+
+#### Read Path 4: `getByPeer` (available in API, unused by tools currently)
+
+**Risk: HIGH** — Returns ALL entries for a peer across all keys with no built-in limit. Not exposed as an LLM tool, but available in the API.
+
+### Read-Side Mitigations
+
+To prevent context window blowout without sacrificing the append-only log, the following safeguards are applied at the `AgentMemory` layer:
+
+| Mitigation | Applies to | Description |
+|---|---|---|
+| **Value truncation** | `get()`, `search()`, `getByPeer()` | Each entry's `value` is truncated to `valueTruncationChars` before returning (default 10,000). Full values retrievable with `fullText: true`. Configure via `--mesh-memory-truncate` or preset. |
+| **Hard max limit** | `get()`, `getByPeer()` | At most `maxEntries` returned regardless of `limit` param (default 50). Configure via `--mesh-memory-max-entries` or preset. |
+| **Distance threshold** | auto-retrieve `search()` | Results with `distance > distanceThreshold` (default 0.6) are discarded. Configure via `--mesh-memory-distance` or preset. |
+| **Exchange truncation** | auto-retrieve `get("exchange")` | Most recent exchange truncated to `exchangeTruncationChars` (default 5,000). Configure via `--mesh-memory-exchange-truncate` or preset. |
+| **Max context budget** | auto-retrieve hook | Total auto-injected memory text capped at `contextBudgetChars` (default 50,000, ~12.5K tokens). Configure via `--mesh-memory-budget` or preset. |
+
+**Resulting read budgets under mitigations:**
+
+| Read path | Without mitigations | With mitigations |
+|---|---|---|
+| Auto-retrieve (hot path) | Up to 20KB per incoming message | **≤contextBudgetChars** (default 50KB, ~12.5K tokens) — <2% of a 1M window |
+| `memory_recall` (LLM tool) | Up to 150KB (unbounded) | **≤maxEntries × truncation** (default 500KB, ~125K tokens) — ~12% of a 1M window |
+| `memory_search` (LLM tool) | Up to 25KB | **≤searchNResults × truncation** (default 50KB, ~12.5K tokens) |
+
+In a 1M token context window (~4M chars), the worst-case read path (`memory_recall` at 500KB / 125K tokens) consumes only ~12% of the window. The auto-retrieve hot path consumes ~1%. These limits are generous enough that `fullText: true` should rarely be needed.
+
+> **Note:** The limits above are designed for 1M-token-class models (Gemini 2.5 Pro, Claude, GPT-4o). If targeting smaller models (32K–128K tokens), reduce the context budget to 12,000 chars and hard max to 20 entries.
+
+**Default:** `@chroma-core/default-embed` — the `all-MiniLM-L6-v2` Sentence Transformer model.
+
+| Property | Value |
+|---|---|
+| Dimensions | 384 |
+| Model | all-MiniLM-L6-v2 (Sentence Transformers) |
+| Runtime | WASM (runs locally in Node.js) |
+| Max sequence length | 256 tokens |
+| External API required | No |
+
+The embedding function is initialized once at `AgentMemory.create()` time and passed to the collection. All subsequent `add` and `query` operations automatically compute embeddings client-side before sending to the ChromaDB server.
+
+### Collection Lifecycle
+
+```
+AgentMemory.create(host, port, "pi-alpha")
+  │
+  ├─ new DefaultEmbeddingFunction()     // Initialize WASM embedding model
+  ├─ new ChromaClient({ host, port })   // Connect to ChromaDB HTTP API
+  └─ client.getOrCreateCollection({ 
+       name: "pi_memory_pi-alpha", 
+       embeddingFunction: embedder 
+     })
+       │
+       ├─ If collection exists → reconnect, all memories available
+       └─ If new → create empty collection with embedding function
+```
+
+### Auto-Save Strategy
+
+The extension automatically saves memories at these points — no LLM action required:
+
+| Trigger | Key | Type | Value |
+|---|---|---|---|
+| LLM responds to a peer (turn_end) | `"exchange"` | `"conversation_turn"` | `[Request] {text}\n[Response] {text}` |
+| Broadcast received (onBroadcast) | `"broadcast"` | `"broadcast"` | `[{type}] {message}` |
+
+**Append-only logging:** Every exchange with a peer creates a new `"exchange"` entry — nothing is overwritten. Over the course of a run, this builds a complete chronological record of all interactions. The LLM can retrieve the most recent N exchanges with `memory_recall(peerId, "exchange", limit=N)` or semantically search the full history with `memory_search`. Storage grows linearly with session activity — a typical multi-peer session produces ~50–200 entries total.
+
+**Outgoing exchanges:** When the LLM initiates a conversation via `mesh_send`, the outgoing message + peer's response is also auto-saved by the `mesh_send` tool's `execute()` method after receiving the response. This ensures both sides of every conversation are captured.
+
+**Fault tolerance:** All ChromaDB calls in auto-save hooks are wrapped in try/catch with debug-level logging. If ChromaDB is unreachable mid-session, the auto-save is silently skipped — mesh communication continues uninterrupted. Memory tools return clear error messages to the LLM so it can adjust its strategy.
+
+### Auto-Retrieve Strategy
+
+When a peer sends a direct message (autoReply=false), the extension automatically:
+
+1. **Semantic search**: Finds the 3 most relevant memories using the incoming message as a query (filtered: distance > 0.6 discarded)
+2. **Last exchange**: Gets the most recent `"exchange"` entry for that peer (truncated to 5,000 chars)
+3. **Context budget**: Total injected memory text is capped at **50,000 characters** (~12.5K tokens) — entries are trimmed shortest-first if the sum exceeds this
+4. **Prepends context**: Formatted and prepended to the user message before it reaches the LLM
+
+Format of the auto-retrieved context:
+```
+[Memory about pi-alpha:
+  She prefers short, code-only responses with no explanations.
+  Last exchange — Request: "how do i connect two libp2p nodes?"
+  Response: "Use dialProtocol() and handle(). Here's a minimal example: ..."
+  We've interacted 12 times total.]
+```
+
+This gives the LLM immediate awareness of who it's talking to and what they discussed before.
+
+### LLM-Callable Memory Tools
+
+Three new tools give the LLM explicit control over memory:
+
+#### `memory_store` — Save a key-value memory
+
+```
+Parameters:
+  peerId: string    — Peer this memory is about
+  key: string       — Category/name (e.g., "project_context", "prefs", "decision")
+  value: string     — The content to remember
+  metadata?: object — Optional additional metadata
+```
+
+The LLM can use this to explicitly remember facts:
+```
+"memory_store: peerId=12D3..., key=decision, value=We agreed to use TypeScript strict mode for this project"
+```
+
+#### `memory_recall` — Recall by peer and key
+
+At least one of `peerId` or `key` is required — you can't recall an unfiltered global dump.
+
+```
+Parameters:
+  peerId?: string   — Filter by peer (required if key is omitted)
+  key?: string      — Filter by key (required if peerId is omitted)
+  limit?: number    — Max results (default 10, hard max 50)
+  fullText?: bool   — Return full untruncated values (default false — truncated to 10,000 chars)
+```
+
+**Read budget:** At most 50 entries × 10,000 chars = 500KB (~125K tokens). Typical use (10 entries × 2,000 chars) = ~20KB (~5K tokens).
+
+Returns memories as formatted text with timestamps:
+```
+
+🔑 **decision** (2h ago)
+We agreed to use TypeScript strict mode for this project.
+
+🔑 **prefs** (5h ago)
+She prefers short, code-only responses with no explanations.
+```
+
+#### `memory_search` — Semantic search
+
+```
+Parameters:
+  query: string     — Natural language search query
+  peerId?: string   — Optional: scope to a specific peer
+  nResults?: number — Max results (default 5)
+  fullText?: bool   — Return full untruncated values (default false — truncated to 10,000 chars)
+```
+
+**Read budget:** 5 entries × 10,000 chars = 50KB max (~12.5K tokens). Entries with distance > 0.6 are excluded.
+
+Returns results ranked by semantic similarity, with distance scores:
+```
+**3 memories similar to "project settings":**
+
+1. 🟢 **decision** (distance: 0.23) — pi-alpha — 2h ago
+   We agreed to use TypeScript strict mode for this project.
+
+2. 🟡 **project_context** (distance: 0.38) — pi-beta — 30m ago
+   Project uses React 18 with Vite bundler and Material UI.
+
+3. 🟡 **prefs** (distance: 0.41) — pi-alpha — 5h ago
+   She prefers short, code-only responses with no explanations.
+```
+
+#### `memory_keys` — List keys for a peer
+
+```
+Parameters:
+  peerId: string    — Peer to list keys for
+```
+
+Returns all unique keys stored for this peer, with counts:
+```
+**Keys for pi-alpha (8 total entries):**
+
+  🔑 exchange (5 entries)
+  🔑 prefs (1 entry)
+  🔑 decision (1 entry)
+  🔑 todo (1 entry)
+```
+
+Use this before `memory_recall` to discover what information is available.
+
+### Prompt Guidelines for Memory Tools
+
+These are injected into the LLM's system context via each tool's `promptGuidelines`:
+
+- **`memory_store`**: "Use memory_store to remember facts, decisions, preferences, or context about peers. Save key information after each meaningful conversation turn — especially when a peer shares preferences, makes decisions, or provides important context. See AGENT-MEMORY.md for usage patterns and anti-patterns."
+- **`memory_recall`**: "Use memory_recall when preparing to interact with a peer to check what you already know about them. Use mesh_list_peers first to get active peer IDs. Auto-retrieve already injects the latest exchange + 3 search results, so use this for deeper context or specific key lookups."
+- **`memory_search`**: "Use memory_search to find relevant past conversations by meaning rather than by exact key. Best for cross-cutting queries like 'what decisions have we made about performance?'"
+- **`memory_keys`**: "Use memory_keys to discover what categories of information you've stored about a peer before recalling specific entries."
 
 ---
 
-## Known Limitations
+## AGENT-MEMORY.md — LLM Usage Guide
 
-1. **mDNS is LAN-only** — Peer discovery via mDNS only works on the same local network segment. For WAN discovery, enable DHT (`--mesh-enable-dht`) and configure bootstrap peers.
+A companion document at [`AGENT-MEMORY.md`](./AGENT-MEMORY.md) teaches the LLM:
 
-2. **DHT is disabled by default** — Wide-area discovery must be explicitly enabled. Even when enabled, DHT bootstrap peers must be configured for the node to join the global DHT.
+- **What happens automatically** (exchange logging, broadcast recording, auto-retrieve on incoming messages)
+- **When to use `memory_store`** (decisions, preferences, constraints, observations — not raw conversation)
+- **When to use `memory_recall`** (before high-stakes responses, checking past decisions, resuming after gaps)
+- **When to use `memory_search`** (cross-cutting semantic queries across all peers)
+- **Key naming conventions** (short, semantic, reusable keys; put detail in values)
+- **Common patterns** (first contact, reconnecting, collaborative decisions, async task tracking)
+- **Anti-patterns** (don't store every exchange manually, don't use unique-per-turn keys, don't store secrets)
 
-3. **No NAT traversal** — The `announceAddresses` config option exists but is not exercised in the CLI. There is no relay, STUN/TURN, or hole-punching support. Nodes behind NAT will only be reachable from within the same local network.
-
-4. **No persistent peer state** — The peer store is in-memory only. On session restart, all peer state is re-discovered from scratch. The extension store is not cleared on shutdown (see [State Management divergence risk](#state-management)), which can cause stale entries across sessions.
-
-5. **No peer scoring or reputation system** — All peers are treated equally. A scoring mechanism (e.g., based on response latency, reliability) could inform routing decisions in future versions.
-
-6. **Protocol version is hardcoded** — The protocol is hardcoded as `/pi-agent/0.1.0`. There is no version negotiation mechanism. Incompatible protocol versions will silently fail to communicate.
-
-7. **Broadcast forwarding to LLM** — All incoming GossipSub broadcasts are forwarded to the LLM as `steer` messages with no rate-limiting, deduplication, or self-filtering. On an active mesh, this can cause significant LLM context consumption.
+The `promptGuidelines` on each memory tool reference this document so the LLM knows where to find detailed usage guidance.
 
 ---
 
@@ -662,8 +1389,21 @@ npx libp2p-pnet-key > swarm.key
 
 1. **NAT traversal** — Relay-based NAT traversal or hole-punching could extend the mesh beyond the local network.
 
-2. **Peer scoring / reputation** — A scoring mechanism based on response latency, reliability, and uptime could inform routing decisions.
+2. **Peer scoring / reputation** — A scoring mechanism based on response latency, reliability, and uptime could inform routing decisions. Could be stored in ChromaDB.
 
 3. **Protocol versioning** — A version negotiation mechanism would enable forward/backward compatibility.
 
 4. **On-demand peer discovery** — The current `mesh_discover` tool is passive (filters known peers by age). An active discovery mechanism (DHT query, mDNS re-publish) would provide real scanning capability.
+
+5. **Run-level memory scoping** — Memories accumulate indefinitely per run. Adding a per-run namespace or automatic cleanup on session shutdown would let users isolate sessions without needing to manage the ChromaDB collection manually.
+
+6. **Configurable embedding models** — Support pluggable embedding functions (OpenAI embeddings, Cohere, custom models) for different quality/speed tradeoffs.
+
+7. **Memory TTL / expiration** — Automatic expiry of old memories to prevent unbounded storage growth.
+
+8. **Memory compression** — Periodically summarize old conversation turns into compact facts using the LLM itself.
+
+9. **Cross-agent memory sharing** — Peers could exchange memory digests during the identify handshake, giving each agent a "gossip-based" understanding of what other agents know about the network.
+
+10. **Parallel ChromaDB connections** — For agents that interact with hundreds of peers, batch ChromaDB operations and connection pooling would reduce latency.
+

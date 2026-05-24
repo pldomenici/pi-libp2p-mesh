@@ -25,7 +25,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types.js";
 import { MeshNode } from "./node.js";
 import { MeshProtocols } from "./protocols.js";
-import { registerMeshTools, setMeshProtocols, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
+import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemory, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
+import { AgentMemory, resolveMemoryConfig } from "./memory.js";
 import os from "node:os";
 
 // ── Shared State ─────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ import os from "node:os";
 
 let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
+let agentMemory: AgentMemory | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
 const store: MeshStore = {
@@ -49,6 +51,20 @@ function notify(_pi: ExtensionAPI, msg: string, level: "info" | "warning" | "err
   console.log(`[pi-libp2p-mesh] ${level}: ${msg}`);
 }
 
+/** Parse a string flag value as integer, returning undefined if empty/zero. */
+function parseOptionalInt(val: unknown): number | undefined {
+  if (val === undefined || val === null || val === "" || val === 0) return undefined;
+  const n = Number(val);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Parse a string flag value as float, returning undefined if empty/zero. */
+function parseOptionalFloat(val: unknown): number | undefined {
+  if (val === undefined || val === null || val === "" || val === 0) return undefined;
+  const n = Number(val);
+  return Number.isNaN(n) ? undefined : n;
+}
+
 function buildConfig(pi: ExtensionAPI): MeshConfig {
   const swarmKeyPath =
     (pi.getFlag("mesh-swarm-key") as string) ||
@@ -62,6 +78,9 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
     gossipTopic: (pi.getFlag("mesh-gossip-topic") as string) || "pi-broadcast",
     listenPorts: { tcp: 0, ws: 0 },
     swarmKeyPath,
+    chromaHost: (pi.getFlag("mesh-chroma-host") as string) || process.env.CHROMA_HOST || undefined,
+    chromaPort: parseOptionalInt(pi.getFlag("mesh-chroma-port") as string) ??
+      (process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : undefined),
   };
 }
 
@@ -172,6 +191,50 @@ export default async function (pi: ExtensionAPI) {
     default: "",
   });
 
+  // Memory / ChromaDB flags
+  pi.registerFlag("mesh-chroma-host", {
+    description: "ChromaDB server hostname (default: localhost, or CHROMA_HOST env var)",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-chroma-port", {
+    description: "ChromaDB server port (default: 8000, or CHROMA_PORT env var)",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-memory-preset", {
+    description:
+      "Memory limit preset: small (32K), medium (128K), large 1M (default). " +
+      "Sets all read-side limits at once. Also PI_MEMORY_PRESET env var.",
+    type: "string",
+    default: "large",
+  });
+  pi.registerFlag("mesh-memory-max-entries", {
+    description: "Override hard max entries returned by memory_recall",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-memory-truncate", {
+    description: "Override value truncation chars for memory entries",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-memory-budget", {
+    description: "Override auto-retrieve context budget in chars",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-memory-exchange-truncate", {
+    description: "Override exchange truncation in chars",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("mesh-memory-distance", {
+    description: "Override distance threshold for search filtering",
+    type: "string",
+    default: "",
+  });
+
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
     // Resolve agent name now (CLI flags are parsed at this point):
@@ -183,6 +246,39 @@ export default async function (pi: ExtensionAPI) {
     store.agentName = flagName || envName || `pi-${hostname}`;
 
     const config = buildConfig(pi);
+
+    // Resolve memory config from CLI flags and env vars
+    const preset = (pi.getFlag("mesh-memory-preset") as string) ||
+      process.env.PI_MEMORY_PRESET || "large";
+    const memoryConfig = resolveMemoryConfig({
+      preset,
+      maxEntries: parseOptionalInt(pi.getFlag("mesh-memory-max-entries")) ??
+        (process.env.PI_MEMORY_MAX_ENTRIES ? Number(process.env.PI_MEMORY_MAX_ENTRIES) : undefined),
+      truncate: parseOptionalInt(pi.getFlag("mesh-memory-truncate")) ??
+        (process.env.PI_MEMORY_TRUNCATE ? Number(process.env.PI_MEMORY_TRUNCATE) : undefined),
+      budget: parseOptionalInt(pi.getFlag("mesh-memory-budget")) ??
+        (process.env.PI_MEMORY_BUDGET ? Number(process.env.PI_MEMORY_BUDGET) : undefined),
+      exchangeTruncate: parseOptionalInt(pi.getFlag("mesh-memory-exchange-truncate")) ??
+        (process.env.PI_MEMORY_EXCHANGE_TRUNCATE ? Number(process.env.PI_MEMORY_EXCHANGE_TRUNCATE) : undefined),
+      distance: parseOptionalFloat(pi.getFlag("mesh-memory-distance")) ??
+        (process.env.PI_MEMORY_DISTANCE ? Number(process.env.PI_MEMORY_DISTANCE) : undefined),
+    });
+
+    // Initialize AgentMemory (non-blocking on failure)
+    try {
+      agentMemory = await AgentMemory.create({
+        host: config.chromaHost ?? "localhost",
+        port: config.chromaPort ?? 8000,
+        agentName: store.agentName,
+        config: memoryConfig,
+      });
+      setAgentMemory(agentMemory);
+      notify(pi, `Memory connected — collection "${agentMemory.collectionName}"`);
+    } catch (err: any) {
+      console.warn(`[pi-libp2p-mesh] ChromaDB unreachable — memory disabled for this session: ${err.message}`);
+      agentMemory = null;
+      setAgentMemory(null);
+    }
 
     try {
       meshNode = await MeshNode.create(config);
@@ -211,6 +307,8 @@ export default async function (pi: ExtensionAPI) {
         timer: ReturnType<typeof setTimeout>;
         /** Set to true when the timeout fires before the entry reaches the LLM. */
         timedOut: boolean;
+        /** Auto-retrieved memory context injected into the user message. */
+        memoryContext?: string;
       };
 
       const requestQueue: PendingRequest[] = [];
@@ -243,10 +341,14 @@ export default async function (pi: ExtensionAPI) {
         if (requestQueue.length === 0) return;
 
         activeRequest = requestQueue.shift()!;
-        pi.sendUserMessage(
-          `[Mesh message from ${activeRequest.request.fromAgent}]\n\n${activeRequest.request.message}`,
-          { deliverAs: "steer" },
-        );
+
+        // Build the user message with optional memory context
+        let userMessage = `[Mesh message from ${activeRequest.request.fromAgent}]\n\n${activeRequest.request.message}`;
+        if (activeRequest.memoryContext) {
+          userMessage = activeRequest.memoryContext + "\n\n" + userMessage;
+        }
+
+        pi.sendUserMessage(userMessage, { deliverAs: "steer" });
       }
 
       // ONE global turn_end listener — registered once, never removed
@@ -255,24 +357,44 @@ export default async function (pi: ExtensionAPI) {
         const req = activeRequest;
         activeRequest = null;
         clearTimeout(req.timer);
-        req.resolve(extractResponseText(event.message));
+        const responseText = extractResponseText(event.message);
+        req.resolve(responseText);
+
+        // Auto-save exchange to memory (fire-and-forget, non-blocking)
+        if (agentMemory) {
+          agentMemory.store({
+            peerId: req.peerId,
+            key: "exchange",
+            value: `[Request from ${req.request.fromAgent}] ${req.request.message}\n[Response] ${responseText}`,
+            metadata: { type: "conversation_turn", requestId: req.request.requestId },
+          }).catch((err) => {
+            console.debug("[pi-libp2p-mesh] auto-save failed:", (err as Error).message);
+          });
+        }
+
         advanceQueue();
       });
 
       // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
-      meshProtocols.onRequest = (peerId, request) => {
+      meshProtocols.onRequest = async (peerId, request) => {
         // If global auto-reply-all is on, echo without LLM
         if (store.autoReplyAll) {
-          return Promise.resolve(
-            `[auto-reply-all] Received: "${request.message}"`,
-          );
+          return `[auto-reply-all] Received: "${request.message}"`;
         }
 
         // Backpressure: reject the request immediately if queue is full
         if (requestQueue.length >= MAX_QUEUE_SIZE) {
-          return Promise.resolve(
-            `[queue-full] Agent request queue is full (max ${MAX_QUEUE_SIZE}). Please retry later.`,
-          );
+          return `[queue-full] Agent request queue is full (max ${MAX_QUEUE_SIZE}). Please retry later.`;
+        }
+
+        // Auto-retrieve memory context about the requesting peer
+        let memoryContext: string | undefined;
+        if (agentMemory) {
+          try {
+            memoryContext = await buildMemoryContext(request, peerId);
+          } catch (err) {
+            console.debug("[pi-libp2p-mesh] auto-retrieve failed:", (err as Error).message);
+          }
         }
 
         return new Promise<string>((resolve) => {
@@ -282,6 +404,7 @@ export default async function (pi: ExtensionAPI) {
             resolve,
             timer: undefined as any,
             timedOut: false,
+            memoryContext,
           };
 
           entry.timer = setTimeout(() => {
@@ -314,7 +437,82 @@ export default async function (pi: ExtensionAPI) {
             { deliverAs: "steer" },
           );
         }
+
+        // Auto-save broadcast to memory
+        if (agentMemory) {
+          agentMemory.store({
+            peerId: msg.fromPeerId,
+            key: "broadcast",
+            value: `[${msg.type ?? "announce"}] ${msg.message}`,
+            metadata: { type: "broadcast" },
+          }).catch((err) => {
+            console.debug("[pi-libp2p-mesh] broadcast auto-save failed:", (err as Error).message);
+          });
+        }
       };
+
+      /**
+       * Build memory context for an incoming request from a peer.
+       * Combines semantic search + most recent exchange, capped by config budget.
+       */
+      async function buildMemoryContext(
+        request: import("./types.js").AgentRequest,
+        peerId: string,
+      ): Promise<string | undefined> {
+        if (!agentMemory) return undefined;
+
+        const peer = store.peers.get(peerId);
+        const name = peer?.agentName ?? peerId.slice(0, 12) + "…";
+
+        // Semantic search for relevant memories (get full values, truncate once below)
+        const searchResults = await agentMemory.search(request.message, {
+          peerId,
+          nResults: 3,
+          fullText: true, // avoid double-truncation: we slice to budget below
+        });
+
+        // Most recent exchange (get full value, truncate once below)
+        const recentExchanges = await agentMemory.get(peerId, "exchange", {
+          limit: 1,
+          fullText: true,
+        });
+
+        // Build context lines, respecting budget
+        const lines: string[] = [];
+        let charCount = 0;
+        const budget = agentMemory.config.contextBudgetChars;
+
+        const addLine = (line: string) => {
+          if (charCount + line.length > budget) return;
+          lines.push(line);
+          charCount += line.length;
+        };
+
+        addLine(`[Memory about ${name}:]`);
+
+        // Add semantic search results
+        for (const r of searchResults) {
+          addLine(`  ${r.key}: ${r.value.slice(0, agentMemory.config.exchangeTruncationChars)}`);
+        }
+
+        // Add most recent exchange (truncated)
+        if (recentExchanges.length > 0) {
+          const ex = recentExchanges[0];
+          addLine(
+            `  Last exchange: ${ex.value.slice(0, agentMemory.config.exchangeTruncationChars)}`,
+          );
+        }
+
+        // Count
+        try {
+          const total = await agentMemory.count(peerId);
+          addLine(`  (${total} total interactions)`);
+        } catch {
+          // ignore
+        }
+
+        return lines.length > 1 ? lines.join("\n") : undefined;
+      }
 
       // Forward node events into our handler
       meshNode.onEvent((ev) => handleNodeEvent(pi, ev));
@@ -357,6 +555,11 @@ export default async function (pi: ExtensionAPI) {
     meshNode = null;
     meshProtocols = null;
     setMeshProtocols(null);
+    if (agentMemory) {
+      await agentMemory.stop();
+      agentMemory = null;
+      setAgentMemory(null);
+    }
     // Clear all peer and broadcast state so the next session starts fresh
     // (the module-level store survives across session restarts because
     //  Node.js caches the extension module)
@@ -367,6 +570,9 @@ export default async function (pi: ExtensionAPI) {
 
   // 3. Register mesh tools
   registerMeshTools(pi, store);
+
+  // 3b. Register memory tools
+  registerMemoryTools(pi, store);
 
   // 4. Register commands for manual control
   pi.registerCommand("mesh-auto-reply", {
