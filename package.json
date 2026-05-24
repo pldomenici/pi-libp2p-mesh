@@ -1,5 +1,5 @@
 {
-  "name": "@earendil-works/pi-libp2p-mesh",
+  "name": "pi-libp2p-mesh",
   "version": "0.3.0",
   "description": "P2P mesh network extension for pi agents built on libp2p — peer discovery, direct messaging, and gossip broadcast.",
   "keywords": [
