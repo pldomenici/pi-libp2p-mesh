@@ -74,10 +74,12 @@ class TestContext {
   async init() {
     console.log(`\n🔧 Starting test node "${AGENT_NAME}"...\n`);
 
+    const swarmKeyPath = process.env.PI_SWARM_KEY || undefined;
     this.node = await MeshNode.create({
       agentName: AGENT_NAME,
       enableMdns: true,
       listenPorts: { tcp: 0, ws: 0 },
+      swarmKeyPath,
     });
 
     this.node.onEvent((ev) => {

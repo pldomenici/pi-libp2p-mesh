@@ -1,0 +1,563 @@
+{
+  "report": {
+    "title": "pi-libp2p-mesh — QA Analysis of All Test Files",
+    "analyst": "john (QA analyst)",
+    "date": "2026-05-23",
+    "files_analyzed": 10,
+    "total_issues": 49,
+    "severity_counts": {
+      "critical": 4,
+      "high": 13,
+      "medium": 19,
+      "low": 13
+    }
+  },
+  "findings": [
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "high",
+      "category": "Flaky Test",
+      "id": "NET-001",
+      "title": "Discovery wait is a hardcoded 10-second sleep",
+      "description": "Line 25: DISCOVERY_WAIT_MS = 10_000 is a fixed timeout. In CI or slow environments, 10s may be insufficient; in fast environments it wastes time. No retry/polling mechanism is used — if discovery takes 10.1s, the test silently reports 0 peers and skips all messaging tests.",
+      "recommendation": "Replace with an adaptive polling loop that waits for at least 1 peer with a configurable max timeout, or retries discovery in intervals."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "high",
+      "category": "Coverage Gap",
+      "id": "NET-002",
+      "title": "No test for peer disconnection/reconnection behavior",
+      "description": "The suite tests initial discovery, messaging, and broadcasts, but never tests what happens when a peer disconnects and reconnects. This is a critical gap for a P2P mesh library that must handle dynamic membership.",
+      "recommendation": "Add tests: (1) disconnect a peer mid-conversation and verify graceful error, (2) reconnect and verify rediscovery, (3) message delivery after reconnect."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "medium",
+      "category": "Fragile Assertion",
+      "id": "NET-003",
+      "title": "autoReply=true assertion depends on peer implementation details",
+      "description": "Line ~193: `if (!resp.message.includes('[auto-response]'))` assumes the peer wraps responses with '[auto-response]'. If the peer changes its response format, this test breaks. This couples the test to implementation details of the peer's auto-reply handler.",
+      "recommendation": "For autoReply=true, assert that the response echoes the original message or that the response is non-empty and arrived within a reasonable time. Avoid checking implementation-specific prefixes."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "medium",
+      "category": "Fragile Assertion",
+      "id": "NET-004",
+      "title": "Message integrity tests assume ECHO: prefix from peer",
+      "description": "Lines ~214, ~285, ~294: Tests check `resp.message.includes('ECHO:...')` or `resp.message.includes(unicode)`. This assumes the peer echoes back messages with a specific prefix. If the peer's auto-reply logic changes, these tests produce false failures.",
+      "recommendation": "Use a dedicated echo protocol or send messages with unique identifiers and verify the exact original message is returned, rather than relying on host-side formatting."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "high",
+      "category": "Coverage Gap",
+      "id": "NET-005",
+      "title": "No protocol-level error recovery tests",
+      "description": "The suite has no tests for: stream reset mid-transfer, malformed response from peer, protocol version mismatch, or timeout recovery. Only one 'invalid peer' timeout test exists, and it doesn't assert an error — it just logs.",
+      "recommendation": "Add tests that inject protocol errors, simulate stream resets, and verify the protocol handler recovers gracefully without crashing the node."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "medium",
+      "category": "Fragile Assertion",
+      "id": "NET-006",
+      "title": "autoReply=false test has 120-second timeout and weak assertions",
+      "description": "Lines ~228-243: Uses timeoutMs: 120_000 which makes the test potentially very slow. The only assertions are `if (!resp.message)` (non-empty) and checking it's not an auto-response. This is fragile because the LLM response is non-deterministic and may take very long.",
+      "recommendation": "Reduce timeout to a reasonable value (e.g., 30s). Add a retry mechanism if the peer is busy. Consider making this test optional (e.g., only run if INTEGRATION=true env var is set) since it depends on an external LLM."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "low",
+      "category": "Minor Issue",
+      "id": "NET-007",
+      "title": "Latency test sample size too small for statistical relevance",
+      "description": "Line 22: LATENCY_ITERATIONS = 5. A 5-sample latency measurement has very high variance and produces misleading p50/p95 statistics. p95 with 5 samples is just the max.",
+      "recommendation": "Increase to at least 30 iterations for meaningful latency statistics, or make the sample size configurable."
+    },
+    {
+      "file": "test-network.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-network.mjs",
+      "severity": "low",
+      "category": "Hardcoded Value",
+      "id": "NET-008",
+      "title": "Concurrent message count is hardcoded to 5",
+      "description": "Line 23: CONCURRENT_MESSAGES = 5. This is a very small concurrency test that may not surface race conditions.",
+      "recommendation": "Parameterize the concurrent message count and add a stress variant with 50+ concurrent messages."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "critical",
+      "category": "Inconsistent Import Paths",
+      "id": "NEG-001",
+      "title": "Imports from TypeScript source files instead of compiled output",
+      "description": "Lines 3-4 import from `./src/node.ts` and `./src/protocols.ts`. All other test files (test-network.mjs, test-cbor-debug.mjs) import from `./dist/node.js` and `./dist/protocols.js`. This inconsistency means: (1) test-negative.mjs requires raw TypeScript execution (ts-node or similar), while other tests run as plain JS; (2) if only dist/ is built, this test fails with module-not-found errors.",
+      "recommendation": "Change imports to `./dist/node.js` and `./dist/protocols.js` to match the other test files, or document that this test requires a different execution environment."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "high",
+      "category": "Weak Assertions",
+      "id": "NEG-002",
+      "title": "All negative tests only check `resp !== undefined` — no content validation",
+      "description": "Every negative test (junk bytes, partial JSON, binary data, 1MB payload, etc.) only asserts `assert(resp !== undefined, 'Handler did not crash')`. There is no verification that the handler returned a proper error response, closed the stream gracefully, or logged the incident. The test would pass even if the handler silently dropped the connection without any response.",
+      "recommendation": "Verify that the response contains meaningful error information (e.g., JSON with an 'error' field or a protocol-level status code). At minimum, check that the response length is reasonable and that the connection is still usable afterward."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "high",
+      "category": "Potential Bug",
+      "id": "NEG-003",
+      "title": "sendRawBytes may have stream lifecycle bug",
+      "description": "Line ~57-73: After `stream.send(bytes)` and `await stream.close()`, the code attempts `for await (const chunk of stream)` to read the response. In many libp2p v3 implementations, closing the writer side also closes the reader side, making the async iteration immediately yield nothing. The test may never actually read the peer's response.",
+      "recommendation": "Review the libp2p stream API semantics. If close() closes both directions, read the response before closing the write side, or use a half-close API. Add assertions that the response was actually read."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "medium",
+      "category": "Race Condition",
+      "id": "NEG-004",
+      "title": "Flood test swallows all errors silently",
+      "description": "Lines ~134-140: The rapid open/close flood test uses `.catch(() => null)` which swallows ALL errors. If all 20 connections fail, the test passes because only the count is checked (20 results).",
+      "recommendation": "Track how many connections succeeded vs failed. Assert that a reasonable proportion (e.g., at least 50%) succeeded. Log individual failures for debugging."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "NEG-005",
+      "title": "No test for handler throwing exceptions, duplicate request IDs, or protocol version negotiation failure",
+      "description": "The negative tests cover garbage input but miss: (1) What happens when the protocol handler's onRequest throws an exception? (2) What happens with duplicate requestId values? (3) What happens when the dialed protocol is not supported? (4) What about invalid UTF-8 byte sequences? (5) What about extremely deep JSON nesting (stack overflow)?",
+      "recommendation": "Add tests for: (1) handler exception propagation, (2) duplicate request IDs in quick succession, (3) dialing unsupported protocols, (4) invalid UTF-8 sequences, (5) deeply nested JSON objects (e.g., 10,000 levels deep)."
+    },
+    {
+      "file": "test-negative.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-negative.mjs",
+      "severity": "low",
+      "category": "Duplication",
+      "id": "NEG-006",
+      "title": "Test runner code is duplicated across test files",
+      "description": "The `test()`, `assert()`, `assertEq()`, and `sleep()` helper functions are copied verbatim into test-negative.mjs, test-identity.mjs, test-fifo-queue.mjs, and test-leak.mjs. Any fix to the test runner must be applied in 4 places.",
+      "recommendation": "Extract the shared test runner into a helper module (e.g., test-helpers.mjs) and import it across all test files."
+    },
+    {
+      "file": "test-fifo-queue.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-fifo-queue.mjs",
+      "severity": "high",
+      "category": "Code Duplication",
+      "id": "FIFO-001",
+      "title": "Entire FifoQueue class is duplicated in test-leak.mjs",
+      "description": "The full `FifoQueue` class (lines 19-100) is an exact duplicate of the one in test-leak.mjs. This means a bug fix or enhancement to the queue logic must be applied in two places. The two test files can easily drift.",
+      "recommendation": "Extract the FifoQueue implementation into a shared module (e.g., src/fifo-queue.ts) and import it from both test files. Each test file should focus on its unique concerns (unit correctness vs. memory leak detection)."
+    },
+    {
+      "file": "test-fifo-queue.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-fifo-queue.mjs",
+      "severity": "medium",
+      "category": "Shared Mutable State",
+      "id": "FIFO-002",
+      "title": "Global `sentMessages` variable is mutated across tests",
+      "description": "Line 16: `let sentMessages = []` is a module-level global that is reset by each test. If tests are ever run concurrently (e.g., via a parallel test runner), the shared state would cause cross-test contamination and flaky failures.",
+      "recommendation": "Either (1) make the mock send function part of the FifoQueue class (constructor injection), or (2) use a scoped variable per test via a setup/teardown pattern."
+    },
+    {
+      "file": "test-fifo-queue.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-fifo-queue.mjs",
+      "severity": "low",
+      "category": "Unused Variable",
+      "id": "FIFO-003",
+      "title": "REQUEST_TIMEOUT_MS is defined but never used in tests",
+      "description": "Line 11: `const REQUEST_TIMEOUT_MS = 60_000` is the default parameter in the FifoQueue class constructor, but every test overrides it with short timeouts (500ms or 5000ms). The constant is dead code.",
+      "recommendation": "Either remove the constant or use it as the default in tests that don't specify a custom timeout."
+    },
+    {
+      "file": "test-fifo-queue.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-fifo-queue.mjs",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "FIFO-004",
+      "title": "No test for zero-timeout or very-short-timeout edge cases",
+      "description": "All tests use timeouts of 50ms or longer. There is no test for timeoutMs=0 (immediate timeout) or negative timeoutMs (likely bug). Also missing: what happens when `completeActive` is called twice in a row (no active request).",
+      "recommendation": "Add edge case tests: (1) timeoutMs=0, (2) timeoutMs=-1 (rejection?), (3) calling completeActive() when no active request exists (should be a no-op), (4) calling send() after the queue has been drained."
+    },
+    {
+      "file": "test-identity.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-identity.mjs",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "ID-001",
+      "title": "No test for seed sizes other than 32, 64, and 0 bytes",
+      "description": "The tests cover: 32-byte seed (works), 0-byte seed (works via empty Uint8Array(32)), 64-byte seed (rejected). Missing: 1-byte seed, 31-byte seed, 33-byte seed, and seeds with non-ASCII characters. The error message for 64-byte seeds is checked, but no other invalid sizes are tested.",
+      "recommendation": "Add tests for: (1) 1-byte seed, (2) 31-byte seed, (3) 33-byte seed, (4) seeds containing null bytes, (5) seeds with full Unicode characters. Verify the error message is consistent for all invalid sizes."
+    },
+    {
+      "file": "test-identity.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-identity.mjs",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "ID-002",
+      "title": "Nodes are created but never started — only PeerId generation is tested",
+      "description": "All tests only call `MeshNode.create()` and check the resulting `peerId`. They never call `.start()`, so they don't test: (1) that the identity works for actual network connections, (2) that the libp2p keychain correctly uses the provided seed, (3) that multiaddres are generated from the correct identity, (4) that identity survives a network-level restart (close + reopen connections).",
+      "recommendation": "Add integration tests that start nodes with seeded identities, connect them, exchange messages, and verify the peer ID used in the connection matches the expected identity."
+    },
+    {
+      "file": "test-identity.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-identity.mjs",
+      "severity": "low",
+      "category": "Minor Issue",
+      "id": "ID-003",
+      "title": "No test for privateKey as a file path (string) vs Uint8Array",
+      "description": "The MeshNode.create() API may accept privateKey as either a Uint8Array (raw seed) or a string path to a key file. The tests only use Uint8Array. If the API supports file paths, this codepath is untested.",
+      "recommendation": "Check the MeshNode.create() API and add tests for any alternative private key input formats (file paths, base64 strings, PEM, etc.)."
+    },
+    {
+      "file": "test-leak.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-leak.mjs",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "LEAK-001",
+      "title": "No actual memory measurements — only structural leak detection",
+      "description": "Despite being called 'memory leak tests', no test calls `process.memoryUsage()` to measure heap growth. The tests only verify queue invariants (counts, sizes). A test that submits 300 messages and checks queue.length=0 does not detect memory leaks from uncleared references, unremoved event listeners, or closure captures.",
+      "recommendation": "Add heap measurement tests: (1) run N iterations while recording heap usage before and after, (2) assert heap growth is bounded, (3) use `global.gc()` (with --expose-gc) to force garbage collection between measurements."
+    },
+    {
+      "file": "test-leak.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-leak.mjs",
+      "severity": "high",
+      "category": "Flaky Test",
+      "id": "LEAK-002",
+      "title": "Rapid timeout flood uses 5ms timeouts — dangerously short and timing-dependent",
+      "description": "Line ~123: `const SHORT = 5;` — 5-millisecond timeouts. The test relies on `await sleep(SHORT * 3)` to wait for all timeouts to fire. On a busy system, 15ms may not be enough for all 20 timeouts to fire, leading to intermittent failures. Combined with the 5-wave loop, this creates a high flake potential.",
+      "recommendation": "Increase the short timeout to at least 50ms and the sleep to `SHORT * 5`. Even better: use a deterministic clock (fake timers) instead of real wall-clock time."
+    },
+    {
+      "file": "test-leak.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-leak.mjs",
+      "severity": "medium",
+      "category": "Non-deterministic Test",
+      "id": "LEAK-003",
+      "title": "Randomized test ('Queue invariants hold after many operations') is non-deterministic",
+      "description": "Lines ~160-175: Uses `Math.random() < 0.7` to decide whether to submit a message. This test produces different call sequences on every run. A fluke sequence could trigger a real bug, or a bug could hide because the right sequence never occurred. Non-deterministic tests are notoriously hard to debug.",
+      "recommendation": "Replace with (1) deterministic sequences that cover all edge cases, or (2) a property-based testing approach (e.g., fast-check) that records the seed for reproducibility."
+    },
+    {
+      "file": "test-leak.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-leak.mjs",
+      "severity": "low",
+      "category": "Minor Issue",
+      "id": "LEAK-004",
+      "title": "Burst load test has convoluted Promise tracking logic",
+      "description": "Lines ~140-150: The burst load test mixes Promise objects and string values in `results` array, then tries to separate them with `instanceof Promise` checks. This is fragile and hard to follow. The logic may have a bug where rejected promises (returned as strings) are double-iterated.",
+      "recommendation": "Simplify: since `send()` returns a Promise that resolves to `'[queue-full]'` for rejections, just `await Promise.all()` on all promises and count the rejections from the resolved values."
+    },
+    {
+      "file": "test-extension.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-extension.mjs",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "EXT-001",
+      "title": "Only tests that imports succeed — no functional testing",
+      "description": "The entire test verifies that 6 TypeScript source files can be imported without throwing. There are zero assertions about the contents of those modules, no functional tests, and no cleanup mechanism. If imports have side effects (e.g., opening files, registering handlers), those are not cleaned up.",
+      "recommendation": "Add minimal functional assertions after each import (e.g., verify expected exports exist, verify class constructors work). If the extension has a lifecycle (init/start/stop), test that."
+    },
+    {
+      "file": "test-extension.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-extension.mjs",
+      "severity": "medium",
+      "category": "Potential Bug",
+      "id": "EXT-002",
+      "title": "Importing TypeScript files directly requires ts-node or pre-compilation",
+      "description": "The test imports `.ts` files directly (lines 1-6). This only works in environments that support TypeScript imports (e.g., via ts-node or a custom loader). Running with plain `node test-extension.mjs` will fail with ERR_UNKNOWN_FILE_EXTENSION. No package.json or configuration indicates how to run this test.",
+      "recommendation": "Either (1) import from `./dist/` like other test files, or (2) add a package.json script with the appropriate loader (e.g., `node --loader ts-node/esm test-extension.mjs`), or (3) document the required execution environment."
+    },
+    {
+      "file": "test-memory-cross-peer.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-cross-peer.mjs",
+      "severity": "low",
+      "category": "Minor Issue",
+      "id": "MCP-001",
+      "title": "Simulated 'agents' are sequential, not concurrent",
+      "description": "Despite the title 'cross-peer', all agents open/close the database sequentially. True concurrent access (two agents having the DB open simultaneously and writing at the same time) is not tested. The WAL mode concurrency is tested once in test-memory-live-mesh.mjs using the production DB.",
+      "recommendation": "Add a test where 2+ agents hold concurrent open connections to the same temp DB file and write simultaneously (using Promise.all for parallel writes). Verify both sees each other's writes without WAL contention errors."
+    },
+    {
+      "file": "test-memory-cross-peer.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-cross-peer.mjs",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "MCP-002",
+      "title": "No test for concurrent delete + read race condition",
+      "description": "One agent deleting a memory while another agent is reading the same memory (under WAL mode) is not tested. SQLite WAL mode allows concurrent readers but writer blocks. If the delete occurs during a read transaction, the read behavior is untested.",
+      "recommendation": "Add a test where agent A reads memories while agent B deletes a memory and verify consistency (the read should see either the old state or the new state, but not a corrupted intermediate state)."
+    },
+    {
+      "file": "test-memory-live-mesh.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-live-mesh.mjs",
+      "severity": "critical",
+      "category": "Data Safety",
+      "id": "LIVE-001",
+      "title": "Operates on production database (~/.pi/mesh.db) with no backup or safety checks",
+      "description": "The test opens `/home/paul/.pi/mesh.db` — the live database shared by all 4 production agents. The test writes test data (`test-agent-alpha`, `test-agent-beta`, `concurrent-a`, `concurrent-b` sessions), then attempts to clean up via `forgetByKey()`. If any test fails before cleanup, test data remains in the production DB. This is extremely risky.",
+      "recommendation": "Change to use a COPY of the production database (e.g., copy ~/.pi/mesh.db to a temp dir first). Add a safety check at the start that refuses to run if the DB has 'test' prefix agents (indicating a previous interrupted run). Or better: use a separate test database path entirely."
+    },
+    {
+      "file": "test-memory-live-mesh.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-live-mesh.mjs",
+      "severity": "high",
+      "category": "Fragile Test",
+      "id": "LIVE-002",
+      "title": "Test assumes specific memories exist from 'earlier tests'",
+      "description": "Line ~109: 'Search across ALL memories' test assumes that `searchMemories('shared_fact')` returns exactly 1 result. This is a very fragile assumption that depends on the exact state of the production database at test time. If another test already cleaned up 'shared_fact', or if a new memory was added, this test fails.",
+      "recommendation": "Don't depend on state from other test runs. Either (1) store test data within the same test and search for it, or (2) assert on existence counts that are expected from the test's own data, not from external state."
+    },
+    {
+      "file": "test-memory-live-mesh.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-live-mesh.mjs",
+      "severity": "high",
+      "category": "Flaky Test",
+      "id": "LIVE-003",
+      "title": "'All 4 peers present' test depends on real agents being online",
+      "description": "Line ~67: `assert(connected.length >= 4, ...)`. This test passes only if all 4 agents (paul, blair, ethan, bob) are currently connected. If any agent is offline, the test fails. This makes the test dependent on external runtime state.",
+      "recommendation": "Either (1) run this as a diagnostic/status check (not a pass/fail test), (2) lower the threshold to `>= 1` and report which peers are connected, or (3) skip this assertion if running outside the live mesh environment."
+    },
+    {
+      "file": "test-memory-live-mesh.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-live-mesh.mjs",
+      "severity": "medium",
+      "category": "No Rollback",
+      "id": "LIVE-004",
+      "title": "No transaction rollback or backup/restore for production DB",
+      "description": "The test writes data, reads it, then calls `forgetByKey()` to clean up. There is no transaction wrapping, no snapshot/restore mechanism, and no verification that cleanup succeeded. If `forgetByKey()` fails silently (e.g., SQL error), test data leaks into production.",
+      "recommendation": "Use a snapshot of the real DB: copy the file before the test, run tests against the copy, delete the copy afterward. This guarantees zero impact on production data regardless of test failures."
+    },
+    {
+      "file": "test-memory-persistence.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-persistence.mjs",
+      "severity": "high",
+      "category": "Code Duplication",
+      "id": "PER-001",
+      "title": "Massive duplication of createTempDir/cleanup/test runner pattern across memory tests",
+      "description": "The `createTempDir()`, `cleanup()`, `test()`, `assert()`, `assertEq()`, and `assertDeepEq()` functions are duplicated in test-memory-persistence.mjs, test-memory-cross-peer.mjs, and test-fifo-queue.mjs. Changes to the test runner must be applied in multiple files.",
+      "recommendation": "Extract shared helpers into a `test-helpers.mjs` module. Include `createTempDir()` and `cleanup()` as well as the common assertion functions."
+    },
+    {
+      "file": "test-memory-persistence.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-persistence.mjs",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "PER-002",
+      "title": "No test for 0 tags, empty tags array, or very large tag sets",
+      "description": "The 'Many tags' test uses exactly 10 tags. Missing edge cases: (1) 0 tags (empty array), (2) 1 tag, (3) 100+ tags (potential SQL query size issues), (4) tags with special SQL characters (quotes, semicolons, newlines), (5) duplicate tags.",
+      "recommendation": "Add tests for: empty tags array, single tag, 50 tags, tags containing SQL injection patterns (e.g., `'; DROP TABLE memories; --`), and duplicate tags."
+    },
+    {
+      "file": "test-memory-persistence.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-persistence.mjs",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "PER-003",
+      "title": "No test for concurrent write access (file locking scenarios)",
+      "description": "All persistence tests open and close DB sessions sequentially. There is no test for what happens when two processes try to write to the same SQLite file simultaneously. SQLite in WAL mode supports concurrent readers but has specific locking behavior for writers.",
+      "recommendation": "Add a test using multiple MeshDatabase instances open simultaneously on the same file, writing concurrently (Promise.all), and verifying no SQLITE_BUSY errors. Also test what happens on SQLITE_BUSY (retry vs fail)."
+    },
+    {
+      "file": "test-memory-persistence.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-persistence.mjs",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "PER-004",
+      "title": "No test for WAL file corruption or recovery",
+      "description": "SQLite WAL mode uses auxiliary files (-wal, -shm). The tests never simulate WAL file corruption, deletion, or the recovery process. If the WAL file is deleted while the database is not checkpointed, data loss can occur.",
+      "recommendation": "Add tests: (1) delete the -wal file before reopening and verify recovery, (2) corrupt the -wal file and verify the DB still opens (with appropriate data loss), (3) test checkpoint behavior explicitly."
+    },
+    {
+      "file": "test-memory-persistence.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-memory-persistence.mjs",
+      "severity": "low",
+      "category": "Minor Issue",
+      "id": "PER-005",
+      "title": "Many tests use the same 'create temp dir, use DB, cleanup' pattern — potential for unclosed handles",
+      "description": "Each test manually creates a temp dir, constructs the DB path, opens the DB, runs assertions, and manually cleans up. If any exception occurs BETWEEN db creation and cleanup(), the temp dir is leaked (the `finally` block catches it, but the pattern is error-prone).",
+      "recommendation": "Use a helper function that manages the lifecycle: `withTempDb(async (db) => { ... })` that guarantees cleanup even on exceptions."
+    },
+    {
+      "file": "test-cbor-debug.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-cbor-debug.mjs",
+      "severity": "critical",
+      "category": "Not a Proper Test",
+      "id": "CBOR-001",
+      "title": "This is a debug script, not a structured test — no test runner, no assertions, no exit codes",
+      "description": "The file creates two local nodes, sends two messages, prints results, and exits. There is no test runner framework, no assertion functions, and no pass/fail tracking. The script uses console.log for results. On failure, it calls process.exit(1) but on success it calls process.exit(0) implicitly. There are zero assertions — it relies on the developer visually inspecting the output.",
+      "recommendation": "Either (1) convert this to a proper test file using the same test runner as other tests, with assertions and pass/fail tracking, or (2) move it to a `scripts/` or `examples/` directory and remove 'test-' from the filename to avoid confusion."
+    },
+    {
+      "file": "test-cbor-debug.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-cbor-debug.mjs",
+      "severity": "high",
+      "category": "Hardcoded Sleep",
+      "id": "CBOR-002",
+      "title": "Hardcoded 8-second discovery wait with no retry",
+      "description": "Line 33: `await new Promise(r => setTimeout(r, 8000))`. This is a fixed sleep for mDNS discovery. If mDNS is not available in the environment, the test sleeps 8 seconds then reports 'No peers discovered' and exits with code 1. No retries, no fallback to other discovery mechanisms.",
+      "recommendation": "Use adaptive polling with a configurable timeout. Check every 1-2 seconds for at least 1 peer, up to a max of 15 seconds. Also document that mDNS must be enabled in the test environment."
+    },
+    {
+      "file": "test-cbor-debug.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-cbor-debug.mjs",
+      "severity": "medium",
+      "category": "Code Quality",
+      "id": "CBOR-003",
+      "title": "Duplicate startup/shutdown code that already exists in TestContext",
+      "description": "The script manually creates MeshNode, MeshProtocols, wires handlers, and shuts down. This exact pattern is encapsulated in test-network.mjs's `TestContext` class. Having a separate implementation increases maintenance burden and risks inconsistency.",
+      "recommendation": "If this file is kept, refactor it to use the TestContext from test-network.mjs, or extract TestContext into a shared helper."
+    },
+    {
+      "file": "test-cbor-debug.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-cbor-debug.mjs",
+      "severity": "medium",
+      "category": "Hardcoded Values",
+      "id": "CBOR-004",
+      "title": "Test expectations are hardcoded and implementation-specific",
+      "description": "Test 1 expects the response to be some JSON with a `message` field. Test 2 expects `resp.message.length` to be the response length. Neither test validates the CONTENT of the response. If the protocol format changes, these tests silently pass or break in confusing ways.",
+      "recommendation": "Add explicit field-level assertions on the response structure. Verify the response has the expected schema (e.g., `{ requestId, fromAgent, message }`) rather than just checking it's non-null."
+    },
+    {
+      "file": "test-cbor-debug.mjs",
+      "path": "/home/paul/Develop/pi-libp2p-mesh/test-cbor-debug.mjs",
+      "severity": "medium",
+      "category": "Potential Silent Failure",
+      "id": "CBOR-005",
+      "title": "mDNS-based two-node test may never work in CI or sandboxed environments",
+      "description": "The test creates two nodes on the same machine and relies on mDNS for discovery. mDNS may be disabled, blocked by firewall, or not available on the loopback interface in CI environments. If this test is ever run in CI, it will fail consistently.",
+      "recommendation": "Add a fallback: if mDNS discovery yields no peers, try dialing the other node's multiaddr directly. Or document that this test requires a local network with mDNS."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "high",
+      "category": "Architecture",
+      "id": "CROSS-001",
+      "title": "No centralized test runner or test configuration",
+      "description": "Each test file implements its own `test()` function, result tracking, and exit code logic. There is no package.json `"test"` script that runs all tests. Each test must be invoked manually with `node <test-file>.mjs`. There is no way to run all tests and get a unified report.",
+      "recommendation": "Add a package.json `"test"` script that runs all test files and aggregates results. Consider using a real test framework (vitest, mocha, ava) instead of the custom runner. At minimum, add a `test-all.mjs` script that imports and runs each test file."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "high",
+      "category": "Architecture",
+      "id": "CROSS-002",
+      "title": "No CI/CD pipeline or automated test execution",
+      "description": "There is no evidence of GitHub Actions, Jenkins, or any CI configuration. Tests are only run manually by the developer. There is no automated regression detection.",
+      "recommendation": "Add a .github/workflows/test.yml (or equivalent) that runs all tests on push/PR. Include linting and type checking in the pipeline."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "medium",
+      "category": "Architecture",
+      "id": "CROSS-003",
+      "title": "Mixed import paths — some from src/ (TS), some from dist/ (JS)",
+      "description": "test-network.mjs and test-cbor-debug.mjs import from `./dist/node.js` (compiled JS). test-negative.mjs, test-identity.mjs import from `./src/node.ts` (raw TS). test-memory-*.mjs files import from `./src/db.ts`. This inconsistency makes it unclear how tests should be executed and what needs to be built first.",
+      "recommendation": "Standardize on importing from `./dist/` (compiled JS). Add a build step before test execution. If TypeScript source imports are needed, add the appropriate ts-node/tsx loader configuration."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "medium",
+      "category": "Test Pattern",
+      "id": "CROSS-004",
+      "title": "No setup/teardown hooks — tests can leak state",
+      "description": "None of the test files use setup (beforeAll) or teardown (afterAll) hooks. The memory-persistence and cross-peer tests manually clean up temp directories via try/finally, but if a test throws between DB creation and cleanup, the temp dir leaks. The live-mesh test permanently modifies the production DB if cleanup fails.",
+      "recommendation": "Add setup/teardown support to the test runner. Use a pattern like `withTempDb(fn)` that guarantees cleanup. For the live-mesh test, ALWAYS use a database copy."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "low",
+      "category": "Consistency",
+      "id": "CROSS-005",
+      "title": "Inconsistent assertion function naming (assert vs assertEq vs assertEqual)",
+      "description": "test-fifo-queue.mjs uses `assertEqual()`, test-identity.mjs and test-negative.mjs use `assertEq()`, test-memory-*.mjs files use `assertEq()` and `assertDeepEq()`. The naming inconsistency makes it harder to copy-paste patterns between test files.",
+      "recommendation": "Standardize on a single set of assertion functions across all test files. Extract to a shared helper module."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "low",
+      "category": "Coverage Gap",
+      "id": "CROSS-006",
+      "title": "No performance or stress tests",
+      "description": "There are no tests for: (1) throughput (messages/second), (2) large numbers of concurrent peers (10+), (3) memory usage under sustained load, (4) CPU usage, (5) garbage collection pressure, (6) message delivery rate under backpressure.",
+      "recommendation": "Add a performance test suite with metrics collection. Include tests for: 100 concurrent messages, 10+ simultaneous peers, 1MB+ payload sizes, and sustained messaging over 60 seconds."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "CROSS-007",
+      "title": "No test for the db.ts module independently (only through integration tests)",
+      "description": "The MeshDatabase class in db.ts is only tested through the memory-persistence, cross-peer, and live-mesh test files. There is no focused unit test for: (1) SQL injection prevention, (2) empty database initialization, (3) schema creation/upgrade, (4) edge cases in tag storage/retrieval, (5) importance sorting when equal, (6) getMessages() query parameters.",
+      "recommendation": "Add a dedicated test-db.mjs file that tests the MeshDatabase API in isolation, including SQL injection attempts, edge cases in all query methods, and schema validation."
+    },
+    {
+      "file": "ALL FILES",
+      "path": "Cross-cutting",
+      "severity": "medium",
+      "category": "Coverage Gap",
+      "id": "CROSS-008",
+      "title": "No test for the tools.ts module",
+      "description": "test-extension.mjs imports tools.ts to verify it compiles, but never calls any of its functions. The mesh tools (mesh_memory, etc.) have no unit tests.",
+      "recommendation": "Add unit tests for each tool function in tools.ts, testing parameter validation, error handling, and expected behavior."
+    }
+  ],
+  "summary": {
+    "critical_findings": [
+      "test-negative.mjs imports from TypeScript source (src/) while all other tests import from compiled JS (dist/) — inconsistency will cause failures in different environments",
+      "test-memory-live-mesh.mjs operates directly on the PRODUCTION ~/.pi/mesh.db with no backup/restore — real agent data is at risk",
+      "test-cbor-debug.mjs is a debug script, not a test — no assertions, no test runner, no exit code logic",
+      "test-negative.mjs's sendRawBytes helper has a potential stream lifecycle bug where closing the writer may also close the reader before response is read"
+    ],
+    "high_severity_findings": [
+      "No centralized test runner — tests must be run individually",
+      "No CI/CD pipeline",
+      "Mixed import paths (src/ vs dist/) across test files",
+      "Massive code duplication of FifoQueue class in two test files",
+      "Multiple tests use hardcoded sleep() for peer discovery instead of polling",
+      "Weak assertions in negative tests — only check 'handler didn't crash', not proper error responses",
+      "Multiple tests depend on external runtime state (production DB, agent availability)",
+      "No setup/teardown hooks — tests can leak state on failure",
+      "No performance, stress, or throughput benchmarks"
+    ],
+    "coverage_gaps": [
+      "No peer disconnection/reconnection tests",
+      "No protocol error recovery tests",
+      "No concurrent DB write tests (WAL mode concurrency)",
+      "No SQL injection prevention tests in db.ts",
+      "No tools.ts unit tests",
+      "No db.ts unit tests in isolation",
+      "No memory heap measurement in leak tests",
+      "No performance/stress tests",
+      "No multiple-hop/relay messaging tests",
+      "No invalid UTF-8 or deeply nested JSON tests in negative suite"
+    ],
+    "files_by_risk": {
+      "highest_risk": ["test-memory-live-mesh.mjs", "test-negative.mjs", "test-cbor-debug.mjs"],
+      "medium_risk": ["test-network.mjs", "test-leak.mjs", "test-extension.mjs"],
+      "lowest_risk": ["test-identity.mjs", "test-fifo-queue.mjs", "test-memory-persistence.mjs", "test-memory-cross-peer.mjs"]
+    }
+  }
+}

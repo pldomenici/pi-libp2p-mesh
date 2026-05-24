@@ -1,22 +1,23 @@
 /**
  * pi-libp2p-mesh / tools.ts
  *
- * Registers four custom pi tools that expose the libp2p mesh to the LLM:
+ * Registers five custom pi tools that expose the libp2p mesh to the LLM:
  *   mesh_list_peers   — enumerate known peers
  *   mesh_send         — send a direct message to a peer
  *   mesh_broadcast    — broadcast via GossipSub
- *   mesh_discover     — scan for new peers
+ *   mesh_discover     — refresh known peer list
+ *   mesh_prune        — remove stale/disconnected peers
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 
-/**
- * Create a TypeBox union of string literal types from a const array.
- */
+/** Create a TypeBox union of string literal types from a const array. */
 function StringEnum<T extends readonly string[]>(values: T): TSchema {
   return Type.Union(values.map((v) => Type.Literal(v)));
 }
+
+import { v4 as uuidv4 } from "uuid";
 
 import type {
   MeshPeer,
@@ -172,7 +173,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
       const text =
         total === 0
-          ? "No peers discovered yet. Use mesh_discover to scan the network."
+          ? "No peers discovered yet. Peer discovery runs automatically via mDNS in the background — ensure other pi agents with pi-libp2p-mesh are running on the same network."
           : `Found ${connected} connected / ${total} total peers:\n\n` +
             peers
               .map((p) => {
@@ -243,7 +244,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           try {
             response = await meshProtocols.sendMessage(params.peerId, {
               protocol: "/pi-agent/0.1.0",
-              requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+              requestId: uuidv4(),
               fromAgent: store.agentName,
               message: params.message,
               autoReply: params.autoReply,
@@ -388,53 +389,60 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
   });
 
   // ── mesh_discover ───────────────────────────────────────────────────────
+  //
+  // NOTE: This tool does NOT trigger active network discovery (libp2p's mDNS
+  // and DHT run autonomously and cannot be triggered on-demand). Instead, it
+  // refreshes the peer list by pruning stale entries and reporting what's
+  // currently known — useful after peers have restarted or gone offline.
+  //
   pi.registerTool({
     name: "mesh_discover",
     label: "Discover Mesh Peers",
     description:
-      "Actively scan the P2P mesh network for new pi agents. Returns any newly discovered " +
-      "peers and their addresses. Peers already in the peer list are included in the total count.",
-    promptSnippet: "Scan for new peers on the mesh",
+      "Refresh the known peer list on the P2P mesh network. Prunes stale/disconnected " +
+      "peers and returns all currently known peers. Peer discovery happens automatically " +
+      "via mDNS (local network) — this tool surfaces what has already been discovered.",
+    promptSnippet: "Refresh known peers on the mesh",
     promptGuidelines: [
-      "Use mesh_discover to find new pi agents on the network before using mesh_send or mesh_broadcast.",
+      "Use mesh_discover to refresh the peer list and prune stale entries before using mesh_send or mesh_broadcast. Note: discovery happens automatically via mDNS in the background — this tool does not trigger network scans.",
     ],
     parameters: Type.Object({}),
 
     async execute(_toolCallId, _params, _signal, onUpdate) {
       onUpdate?.({
-        content: [{ type: "text", text: "Scanning network for new peers…" }],
+        content: [{ type: "text", text: "Refreshing peer list and pruning stale entries…" }],
         details: {},
       });
 
-      const { peers } = listPeers(store);
-      const newPeers = peers.filter(
-        (p) => Date.now() - p.discoveredAt < 10_000,
-      );
+      // Prune stale peers first so the view is fresh
+      const pruned = pruneAllDisconnected(store);
+
+      const { peers, connected, total } = listPeers(store);
 
       onUpdate?.({
         content: [
           {
             type: "text",
-            text: `Found ${peers.length} known peer(s), ${newPeers.length} recently discovered.`,
+            text: `${total} known peer(s) (${connected} connected, ${pruned} stale pruned).`,
           },
         ],
         details: {},
       });
 
       const result: MeshDiscoverResult = {
-        peersFound: peers.length,
+        peersFound: total,
         peers,
       };
 
       const text =
-        peers.length === 0
-          ? "No peers discovered yet. Ensure other pi agents with pi-libp2p-mesh are running on the same network (mDNS) or configure DHT/bootstrap peers."
-          : `Discovered ${peers.length} peer(s):\n\n` +
+        total === 0
+          ? "No peers known. Peer discovery via mDNS runs in the background — ensure other pi agents with pi-libp2p-mesh are running on the same network."
+          : `${connected}/${total} peer(s):\n\n` +
             peers
               .map((p) => {
                 const name = p.agentName ?? "unnamed";
                 const age = Math.round((Date.now() - p.discoveredAt) / 1000);
-                return `  • **${name}** — ${p.id} (${p.status}, ${age}s ago)`;
+                return `  ${p.status === "connected" ? "🟢" : "🔴"} **${name}** — ${p.id} (${p.status}, ${age}s ago)`;
               })
               .join("\n");
 

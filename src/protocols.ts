@@ -242,7 +242,7 @@ export class MeshProtocols {
         signal: abortController.signal,
       });
 
-      // Write the request to the stream (v3: send + close to signal end-of-request)
+      // Write the request to the stream (v3: send + half-close write side to signal end-of-request)
       stream.send(encode(fullRequest));
       await stream.close({ signal: abortController.signal });
 
@@ -252,6 +252,8 @@ export class MeshProtocols {
       return decode(raw) as AgentResponse;
     } finally {
       clearTimeout(timeoutId);
+      // Best-effort full cleanup in case of error during read.
+      // If the stream is already half-closed, this is a safe no-op.
       if (stream != null) {
         try {
           await stream.close();

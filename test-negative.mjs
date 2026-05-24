@@ -15,8 +15,8 @@
  *   PI_MESH_NAME=neg-test node test-negative.mjs
  */
 
-import { MeshNode } from './src/node.ts';
-import { MeshProtocols } from './src/protocols.ts';
+import { MeshNode } from './dist/node.js';
+import { MeshProtocols } from './dist/protocols.js';
 
 const AGENT_NAME = process.env.PI_MESH_NAME || `neg-test-${process.pid}`;
 const DISCOVERY_WAIT_MS = 8_000;
@@ -65,10 +65,12 @@ class TestContext {
   async init() {
     console.log(`\n🔧 Starting negative test node "${AGENT_NAME}"...\n`);
 
+    const swarmKeyPath = process.env.PI_SWARM_KEY || undefined;
     this.node = await MeshNode.create({
       agentName: AGENT_NAME,
       enableMdns: true,
       listenPorts: { tcp: 0, ws: 0 },
+      swarmKeyPath,
     });
     await this.node.start();
 

@@ -116,7 +116,7 @@ index.ts
    - Wires inbound broadcasts to `pi.sendUserMessage()` so the LLM sees them
    - Starts background stale-peer pruning (every 30s)
 3. **`session_shutdown` handler** — stops the node, cancels pruning timer, tears down protocols
-4. **Command Registration** — `/auto-reply`, `/mesh-list-peers`, `/mesh-discover`, `/mesh-prune`
+4. **Command Registration** — `/mesh-auto-reply`, `/mesh-list-peers`, `/mesh-discover`, `/mesh-prune`
 5. **Delegates tool registration** to `registerMeshTools()` in `tools.ts`
 
 **Singleton state:**
@@ -181,6 +181,8 @@ class MeshNode {
 - `peer:disconnected` — a transport connection was dropped
 - `peer:identified` — the peer's Identify protocol completed (agent name available)
 
+> **Note:** The `MeshNodeEvent` union type also includes `message` and `broadcast` event variants, but `MeshNode` itself never emits them. These event types are defined for future integration between `MeshNode` and `MeshProtocols`. Currently, message and broadcast events flow through `MeshProtocols` callbacks (`onMessage`, `onBroadcast`) directly to the extension layer.
+
 ---
 
 ### protocols.ts — MeshProtocols (Messaging)
@@ -217,13 +219,13 @@ class MeshProtocols {
 
 **Direct messaging protocol (`/pi-agent/0.1.0`):**
 
-Handshake is a simple JSON request-response over a libp2p stream:
+Handshake is a simple CBOR-encoded request-response over a libp2p stream:
 
-1. **Sender:** Opens a stream, writes a JSON `AgentRequest`, closes write side
-2. **Receiver:** Reads the stream, processes the request, writes a JSON `AgentResponse`
+1. **Sender:** Opens a stream, writes a CBOR-encoded `AgentRequest`, closes write side
+2. **Receiver:** Reads the stream, processes the request, writes a CBOR-encoded `AgentResponse`
 3. **Sender:** Reads the response, parses it, returns it to the caller
 
-The protocol includes a **60-second default timeout** (configurable per-request via `timeoutMs`) managed by an `AbortController`. A **retry loop** (2 attempts, 500ms delay) handles transient dial failures.
+The protocol includes a **60-second default timeout** (configurable per-request via `timeoutMs`) managed by an `AbortController`. The **tool layer** (`tools.ts` `mesh_send`) implements a retry loop (2 attempts, 500ms delay) for transient dial failures before returning to the LLM — the protocol layer (`protocols.ts` `sendMessage`) does not retry.
 
 **Incoming message handler decision tree:**
 
@@ -238,7 +240,7 @@ autoReply === true?
 
 **GossipSub broadcast:**
 
-- Publishes JSON-serialized `BroadcastMessage` to the configured topic
+- Publishes CBOR-serialized `BroadcastMessage` to the configured topic
 - Incoming broadcasts are parsed and forwarded to the `onBroadcast` callback
 - `resolvePubsub()` resolves the GossipSub instance from `libp2p.services.pubsub` (v3 pattern) with fallback to `libp2p.pubsub`
 
@@ -305,7 +307,7 @@ Defines all shared TypeScript interfaces and types:
 | `AgentRequest` | `protocol`, `requestId`, `fromAgent`, `fromPeerId`, `timestamp`, `message`, `autoReply?`, `timeoutMs?` |
 | `AgentResponse` | `requestId`, `fromAgent`, `fromPeerId`, `timestamp`, `message`, `error` |
 | `BroadcastMessage` | `fromAgent`, `fromPeerId`, `timestamp`, `message`, `type?` |
-| `MeshConfig` | `agentName`, `listenPorts?`, `enableMdns?`, `enableDht?`, `bootstrapPeers?`, `gossipTopic?`, `announceAddresses?`, `privateKey?` |
+| `MeshConfig` | `agentName`, `listenPorts?`, `enableMdns?`, `enableDht?`, `bootstrapPeers?`, `gossipTopic?`, `announceAddresses?`, `privateKey?`, `swarmKeyPath?` |
 | `MeshNodeEvent` | Union: `peer:discovered`, `peer:connected`, `peer:disconnected`, `peer:identified`, `message`, `broadcast` |
 | `MeshSendResult` | `peerId`, `agentName?`, `response`, `error?` |
 | `MeshBroadcastResult` | `topic`, `peersReached`, `messageId` |
@@ -336,8 +338,8 @@ const DEFAULT_CONFIG: Partial<MeshConfig> = {
 └──────────┘     └──────────┘     └──────────────┘     └──────────────────┘
                                           │                      │
                                      dial peer              read stream
-                                     open stream            parse JSON
-                                     write JSON             autoReply?
+                                     open stream            parse CBOR
+                                     write CBOR            autoReply?
                                      close write              ├─ YES: echo
                                      read response            └─ NO:  enqueue
                                      parse response                 in FIFO queue
@@ -345,7 +347,7 @@ const DEFAULT_CONFIG: Partial<MeshConfig> = {
                                           │                 wait for LLM
                                           │                 turn_end
                                           │                      │
-                                          └────── JSON Response ─┘
+                                          └────── CBOR Response ─┘
 ```
 
 **Tool execution steps:**
@@ -363,8 +365,8 @@ const DEFAULT_CONFIG: Partial<MeshConfig> = {
 │ mesh_brdx│     │          │     │              │     │                  │
 └──────────┘     └──────────┘     └──────────────┘     └──────────────────┘
                                           │                      │
-                                    JSON serialize        publish on
-                                    PendingRequest       "pi-broadcast"
+                                    CBOR serialize       publish on
+                                    BroadcastMessage     "pi-broadcast"
                                           │               topic
                                           │                      │
                                     record in              propagate to
@@ -442,7 +444,8 @@ Incoming request (autoReply: false)
 | | `@libp2p/bootstrap` (optional) | Bootstrap nodes for DHT |
 | **Identity** | `@libp2p/identify` | Peer identity exchange (agent name, protocols) |
 | **Pub/Sub** | `@chainsafe/libp2p-gossipsub` | Topic-based broadcast messaging |
-| **Custom** | `/pi-agent/0.1.0` (custom protocol) | Direct agent-to-agent JSON messaging |
+| **Private Network** | `@libp2p/pnet` | Optional swarm key (PSK) for private P2P networks — all peers must share the same key |
+| **Custom** | `/pi-agent/0.1.0` (custom protocol) | Direct agent-to-agent CBOR-encoded messaging |
 
 **Identity:** Each agent gets an Ed25519 keypair. By default, a new keypair is generated per session, resulting in a new PeerId each time. Passing `config.privateKey` (a 32-byte seed) gives the agent **stable identity** across restarts — the PeerId is deterministically derived from the seed.
 
@@ -496,13 +499,13 @@ pi agent starts
 **Broadcast history:**
 - Capped at `MAX_BROADCAST_HISTORY = 200` entries (M3 fix)
 - Oldest entries evicted when cap is exceeded
-- Only populated by outgoing broadcasts from `mesh_broadcast` tool; incoming broadcasts are forwarded to the LLM but not stored
+- Populated by both outgoing broadcasts (from `mesh_broadcast` tool) and incoming broadcasts (from GossipSub). Incoming broadcasts are also forwarded to the LLM via `pi.sendUserMessage()`
 
 ---
 
 ## Design Decisions & Fixes
 
-These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPORT.md) and subsequently implemented.
+These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPORT.md). Items **H1–H4** (high severity) and **M1–M3** (medium severity) were subsequently implemented. Items **L1** (double-pass memory copy in `readStream`) and **L2** (redundant peer iteration in pruning) remain as future optimizations.
 
 | Label | Severity | File | Issue | Solution |
 |---|---|---|---|---|
@@ -523,10 +526,12 @@ These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPOR
 | `--agent-name` | string | `pi-<hostname>` | Agent name for the mesh (also from `PI_MESH_NAME` or `PI_COMM_NAME` env var) |
 | `--mesh-enable-dht` | boolean | `false` | Enable Kademlia DHT for wide-area discovery |
 | `--mesh-gossip-topic` | string | `pi-broadcast` | GossipSub topic for broadcast messages |
+| `--mesh-swarm-key` | string | — | Path to a `swarm.key` file for private P2P network (PSK). All peers must share the same key. See [Private Network](#private-network-swarm-key). |
 
 **Environment variables:**
 - `PI_MESH_NAME` — agent name (overrides default, but CLI flag takes priority)
 - `PI_COMM_NAME` — backward-compatible alias for agent name
+- `PI_SWARM_KEY` — path to a `swarm.key` file (alternative to `--mesh-swarm-key` flag)
 
 **Config priority:** CLI flag → `PI_MESH_NAME` env var → `PI_COMM_NAME` env var → `pi-<hostname>`
 
@@ -536,7 +541,7 @@ These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPOR
 
 | Command | Role | Description |
 |---|---|---|
-| `/auto-reply [on\|off]` | Toggle | When on, all incoming mesh messages auto-echo without involving the LLM. No argument toggles current state. |
+| `/mesh-auto-reply [on\|off]` | Toggle | When on, all incoming mesh messages auto-echo without involving the LLM. No argument toggles current state. |
 | `/mesh-list-peers` | Read | List all known peers with connection status, agent name, age |
 | `/mesh-discover` | Read | Scan for recently discovered peers |
 | `/mesh-prune` | Write | Remove all disconnected/stale peers immediately |
@@ -549,7 +554,7 @@ All tests located in the project root (`*.mjs`). Run with `npm test` (requires b
 
 | Suite | File | Count | Type | Network Required |
 |---|---|---|---|---|
-| Comprehensive | `test-network.mjs` | 25 tests | Integration | ✅ (needs peers) |
+| Comprehensive | `test-network.mjs` | 26 tests | Integration | ✅ (needs peers) |
 | Rigorous | `rigorous-concurrent-test.mjs` | 82 tests (10 phases) | Stress/load | ✅ (needs peers) |
 | FIFO Queue | `test-fifo-queue.mjs` | 8 tests | Unit | ❌ |
 | Memory/Leak | `test-leak.mjs` | 7 tests | Unit | ❌ |
@@ -593,10 +598,72 @@ export { default } from './dist/index.js';
 
 ---
 
+## Private Network (Swarm Key)
+
+`pi-libp2p-mesh` supports **private P2P networks** via a pre-shared key (PSK) using `@libp2p/pnet`. When a swarm key is configured, all libp2p connections are wrapped in an XSalsa20 stream cipher — peers without the key cannot communicate.
+
+### Configuration
+
+```bash
+# Via CLI flag
+pi --mesh-swarm-key ./swarm.key
+
+# Via environment variable
+export PI_SWARM_KEY=./swarm.key
+```
+
+### Swarm Key File Format
+
+The key file uses the standard libp2p PSK format (95 bytes):
+
+```
+/key/swarm/psk/1.0.0/
+/base16/
+<32-byte hex-encoded key>
+```
+
+### Generating a Swarm Key
+
+```bash
+# Using libp2p's utility (if available)
+npx libp2p-pnet-key > swarm.key
+
+# Or manually: generate 32 random bytes, hex-encode, format as above
+```
+
+### Security Implications
+
+- All mesh traffic is encrypted end-to-end by Noise protocol regardless of swarm key.
+- The swarm key adds a **network-level access control** layer: only peers sharing the key can even establish connections.
+- The key is loaded at `MeshNode.create()` time and cannot be changed without restarting the node.
+- A project's `swarm.key` should be kept out of version control (add to `.gitignore`).
+
+---
+
+## Known Limitations
+
+1. **mDNS is LAN-only** — Peer discovery via mDNS only works on the same local network segment. For WAN discovery, enable DHT (`--mesh-enable-dht`) and configure bootstrap peers.
+
+2. **DHT is disabled by default** — Wide-area discovery must be explicitly enabled. Even when enabled, DHT bootstrap peers must be configured for the node to join the global DHT.
+
+3. **No NAT traversal** — The `announceAddresses` config option exists but is not exercised in the CLI. There is no relay, STUN/TURN, or hole-punching support. Nodes behind NAT will only be reachable from within the same local network.
+
+4. **No persistent peer state** — The peer store is in-memory only. On session restart, all peer state is re-discovered from scratch. The extension store is not cleared on shutdown (see [State Management divergence risk](#state-management)), which can cause stale entries across sessions.
+
+5. **No peer scoring or reputation system** — All peers are treated equally. A scoring mechanism (e.g., based on response latency, reliability) could inform routing decisions in future versions.
+
+6. **Protocol version is hardcoded** — The protocol is hardcoded as `/pi-agent/0.1.0`. There is no version negotiation mechanism. Incompatible protocol versions will silently fail to communicate.
+
+7. **Broadcast forwarding to LLM** — All incoming GossipSub broadcasts are forwarded to the LLM as `steer` messages with no rate-limiting, deduplication, or self-filtering. On an active mesh, this can cause significant LLM context consumption.
+
+---
+
 ## Future Considerations
 
-1. **NAT traversal** — The `announceAddresses` config option exists but is not exercised. Relay-based NAT traversal or hole-punching could extend the mesh beyond the local network.
+1. **NAT traversal** — Relay-based NAT traversal or hole-punching could extend the mesh beyond the local network.
 
-2. **Peer scoring / reputation** — The current mesh treats all peers equally. A scoring mechanism (e.g., based on response latency, reliability) could inform routing decisions.
+2. **Peer scoring / reputation** — A scoring mechanism based on response latency, reliability, and uptime could inform routing decisions.
 
-3. **Protocol versioning** — The protocol is hardcoded as `/pi-agent/0.1.0`. A version negotiation mechanism would enable forward/backward compatibility.
+3. **Protocol versioning** — A version negotiation mechanism would enable forward/backward compatibility.
+
+4. **On-demand peer discovery** — The current `mesh_discover` tool is passive (filters known peers by age). An active discovery mechanism (DHT query, mDNS re-publish) would provide real scanning capability.

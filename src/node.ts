@@ -376,14 +376,21 @@ export class MeshNode {
       const stored = this.peerStore.get(peerIdStr);
       if (stored?.status === "connected") continue;
 
-      const peerIdObj = peerIdFromString(peerIdStr);
-      this.libp2p
-        .dial(peerIdObj)
-        .catch((err: any) => {
-          console.debug(
-            `[MeshNode] auto-dial failed for ${peerIdStr.slice(0, 12)}…: ${err.message}`,
-          );
-        });
+      try {
+        const peerIdObj = peerIdFromString(peerIdStr);
+        this.libp2p
+          .dial(peerIdObj)
+          .catch((err: any) => {
+            console.debug(
+              `[MeshNode] auto-dial failed for ${peerIdStr.slice(0, 12)}…: ${err.message}`,
+            );
+          });
+      } catch (err: any) {
+        // Malformed peer ID string — log and continue to next peer
+        console.debug(
+          `[MeshNode] skipped invalid peer ID ${peerIdStr.slice(0, 12)}…: ${err.message}`,
+        );
+      }
     }
   }
 

@@ -299,6 +299,10 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming broadcasts — record in store, notify, and optionally forward to LLM
       meshProtocols.onBroadcast = (msg) => {
+        // Skip our own broadcasts — GossipSub delivers to all subscribers
+        // including the publisher, creating a feedback loop if we re-process
+        if (meshNode && msg.fromPeerId === meshNode.peerId) return;
+
         handleNodeEvent(pi, { type: "broadcast", message: msg });
 
         // If auto-reply-all is off, forward the broadcast to the LLM so the agent
@@ -353,7 +357,12 @@ export default async function (pi: ExtensionAPI) {
     meshNode = null;
     meshProtocols = null;
     setMeshProtocols(null);
-    notify(pi, "Mesh node stopped");
+    // Clear all peer and broadcast state so the next session starts fresh
+    // (the module-level store survives across session restarts because
+    //  Node.js caches the extension module)
+    store.peers.clear();
+    store.broadcastHistory = [];
+    notify(pi, "Mesh node stopped — state cleared");
   });
 
   // 3. Register mesh tools
@@ -397,7 +406,7 @@ export default async function (pi: ExtensionAPI) {
       const { peers, connected, total } = listPeers(store);
 
       if (total === 0) {
-        ctx.ui.notify("No peers discovered. Use mesh_discover to scan.", "info");
+        ctx.ui.notify("No peers known. Peer discovery runs automatically via mDNS in the background.", "info");
         return;
       }
 
@@ -416,23 +425,23 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("mesh-discover", {
-    description: "Scan for new peers on the P2P mesh network",
+    description: "Refresh the known peer list — prunes stale entries and shows currently known peers",
     handler: async (_args, ctx) => {
       if (!meshNode) {
         ctx.ui.notify("Mesh node not running", "warning");
         return;
       }
 
-      ctx.ui.notify("Scanning network for new peers…", "info");
+      ctx.ui.notify("Refreshing peer list…", "info");
+
+      // Prune stale peers first so the view is fresh
+      const pruned = pruneAllDisconnected(store);
 
       const { peers, connected, total } = listPeers(store);
-      const newPeers = peers.filter(
-        (p) => Date.now() - p.discoveredAt < 10_000,
-      );
 
       if (total === 0) {
         ctx.ui.notify(
-          "No peers discovered. Ensure other pi agents with pi-libp2p-mesh are running on the same network.",
+          "No peers known. Peer discovery via mDNS runs in the background — ensure other pi agents with pi-libp2p-mesh are running on the same network.",
           "warning",
         );
         return;
@@ -446,7 +455,7 @@ export default async function (pi: ExtensionAPI) {
       });
 
       ctx.ui.notify(
-        `${connected}/${total} peers (${newPeers.length} recently discovered):\n${lines.join("\n")}`,
+        `${connected}/${total} peers (${pruned} stale pruned):\n${lines.join("\n")}`,
         "info",
       );
     },
