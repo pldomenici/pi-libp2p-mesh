@@ -84,6 +84,7 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
     chromaHost: (pi.getFlag("mesh-chroma-host") as string) || process.env.CHROMA_HOST || undefined,
     chromaPort: parseOptionalInt(pi.getFlag("mesh-chroma-port") as string) ??
       (process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : undefined),
+    chromaToken: (pi.getFlag("mesh-chroma-token") as string) || process.env.CHROMA_TOKEN || undefined,
   };
 }
 
@@ -213,6 +214,13 @@ export default async function (pi: ExtensionAPI) {
     type: "string",
     default: "",
   });
+  pi.registerFlag("mesh-chroma-token", {
+    description:
+      "Auth token for ChromaDB (x-chroma-token header). " +
+      "Also set via CHROMA_TOKEN env var.",
+    type: "string",
+    default: "",
+  });
   pi.registerFlag("mesh-memory-preset", {
     description:
       "Memory limit preset: small (32K), medium (128K), large 1M (default). " +
@@ -280,6 +288,7 @@ export default async function (pi: ExtensionAPI) {
       agentMemory = await AgentMemory.create({
         host: config.chromaHost ?? "localhost",
         port: config.chromaPort ?? 8000,
+        token: config.chromaToken,
         agentName: store.agentName,
         config: memoryConfig,
       });

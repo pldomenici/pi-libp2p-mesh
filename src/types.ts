@@ -117,6 +117,8 @@ export interface MeshConfig {
   chromaHost?: string;
   /** ChromaDB server port (default: 8000) */
   chromaPort?: number;
+  /** Optional auth token for ChromaDB (x-chroma-token header). Also CHROMA_TOKEN env var. */
+  chromaToken?: string;
 }
 
 /** Default configuration */

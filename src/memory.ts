@@ -59,6 +59,7 @@ export class AgentMemory {
   static async create(opts: {
     host?: string;
     port?: number;
+    token?: string;
     agentName: string;
     config?: MemoryConfig;
   }): Promise<AgentMemory> {
@@ -76,8 +77,10 @@ export class AgentMemory {
       throw new Error(`Embedding function initialization failed: ${err.message}`);
     }
 
-    // Connect to ChromaDB
-    const client = new ChromaClient({ host, port, ssl: false });
+    // Connect to ChromaDB — pass auth token via x-chroma-token header if provided
+    const headers: Record<string, string> = {};
+    if (opts.token) headers["x-chroma-token"] = opts.token;
+    const client = new ChromaClient({ host, port, ssl: false, ...(opts.token ? { headers } : {}) });
 
     // Verify ChromaDB is reachable with a heartbeat check before creating the collection
     try {

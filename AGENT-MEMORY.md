@@ -202,6 +202,25 @@ All values are **truncated to 10,000 characters** by default and at most **50 en
 - **Recall order is not guaranteed to match insertion order.** ChromaDB may return entries in a different sequence than they were stored. This is harmless for the append-only design but means you shouldn't rely on positional indexing.
 - **50KB payloads work** and are correctly embedded, searched, and truncated. The guidance to keep entries concise is for LLM context efficiency, not a hard technical limit.
 
+## Security
+
+ChromaDB runs on `localhost` by default — it is not exposed to the network. Within the mesh, trust is implicit: any peer with the swarm key is considered legitimate.
+
+For defense-in-depth, ChromaDB supports token-based authentication. Set a token via:
+
+- **CLI flag:** `--mesh-chroma-token your-secret-token`
+- **Env var:** `CHROMA_TOKEN=your-secret-token`
+
+On the ChromaDB server side, configure the same token:
+
+```bash
+chroma run --path ./data \
+  --auth ssl-no-verify \
+  --auth-token your-secret-token
+```
+
+When a token is configured, all requests include the `x-chroma-token` header. Without the correct token, the server returns 401 Unauthorized.
+
 ---
 
 ## Common Patterns
