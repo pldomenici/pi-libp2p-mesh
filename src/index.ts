@@ -50,12 +50,18 @@ function notify(_pi: ExtensionAPI, msg: string, level: "info" | "warning" | "err
 }
 
 function buildConfig(pi: ExtensionAPI): MeshConfig {
+  const swarmKeyPath =
+    (pi.getFlag("mesh-swarm-key") as string) ||
+    process.env.PI_SWARM_KEY ||
+    undefined;
+
   return {
     agentName: store.agentName,
     enableMdns: true,
     enableDht: pi.getFlag("mesh-enable-dht") as boolean,
     gossipTopic: (pi.getFlag("mesh-gossip-topic") as string) || "pi-broadcast",
     listenPorts: { tcp: 0, ws: 0 },
+    swarmKeyPath,
   };
 }
 
@@ -157,6 +163,13 @@ export default async function (pi: ExtensionAPI) {
     description: "GossipSub topic for broadcast messages",
     type: "string",
     default: "pi-broadcast",
+  });
+  pi.registerFlag("mesh-swarm-key", {
+    description:
+      "Path to a swarm.key file for private P2P network (also PI_SWARM_KEY env var). " +
+      "All peers must share the same key.",
+    type: "string",
+    default: "",
   });
 
   // 1. Session lifecycle: start node
@@ -347,7 +360,7 @@ export default async function (pi: ExtensionAPI) {
   registerMeshTools(pi, store);
 
   // 4. Register commands for manual control
-  pi.registerCommand("auto-reply", {
+  pi.registerCommand("mesh-auto-reply", {
     description: "Toggle auto-reply mode (when on, all incoming mesh messages echo without LLM)",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
@@ -366,7 +379,7 @@ export default async function (pi: ExtensionAPI) {
         );
       } else {
         ctx.ui.notify(
-          `Usage: /auto-reply [on|off] — current: ${store.autoReplyAll ? "ON" : "off"}`,
+          `Usage: /mesh-auto-reply [on|off] — current: ${store.autoReplyAll ? "ON" : "off"}`,
           "warning",
         );
       }

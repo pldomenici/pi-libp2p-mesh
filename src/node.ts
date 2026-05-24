@@ -18,6 +18,8 @@ import { bootstrap } from "@libp2p/bootstrap";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { preSharedKey } from "@libp2p/pnet";
+import { readFile } from "node:fs/promises";
 import type { PeerId, PrivateKey, IdentifyResult } from "@libp2p/interface";
 
 import {
@@ -106,6 +108,17 @@ export class MeshNode {
       privateKey = await generateKeyPair("Ed25519");
     }
 
+    // ── Swarm Key (private network PSK) ──────────────────────────────────
+    // Reads the standard 95-byte swarm.key file format:
+    //   /key/swarm/psk/1.0.0/
+    //   /base16/
+    //   <hex-encoded 32-byte key>
+    let connectionProtector: ReturnType<typeof preSharedKey> | undefined;
+    if (mergedConfig.swarmKeyPath) {
+      const psk = await readFile(mergedConfig.swarmKeyPath);
+      connectionProtector = preSharedKey({ psk });
+    }
+
     // Assemble libp2p options
     // Use a local type alias instead of `any` for type-safety
     type Libp2pOptions = Parameters<typeof createLibp2p>[0];
@@ -133,6 +146,7 @@ export class MeshNode {
         identify: identify(),
         pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }) as any,
       },
+      connectionProtector,
     };
 
     // libp2pConfig is declared as Libp2pOptions — use any for dynamic mutations

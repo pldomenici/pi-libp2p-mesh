@@ -103,7 +103,7 @@ pi --agent-name my-agent --mesh-enable-dht
 
 | Command | Description |
 |---|---|
-| `/auto-reply [on\|off]` | Toggle auto-reply mode (when on, incoming messages echo without LLM) |
+| `/mesh-auto-reply [on\|off]` | Toggle auto-reply mode (when on, incoming messages echo without LLM) |
 | `/mesh-list-peers` | List all known peers on the mesh |
 | `/mesh-discover` | Scan for new peers on the network |
 | `/mesh-prune` | Remove all disconnected/stale peers |

@@ -105,6 +105,12 @@ export interface MeshConfig {
    * a new one — giving the agent a stable identity across restarts.
    */
   privateKey?: Uint8Array;
+  /**
+   * Path to a swarm.key file for private network (PSK).
+   * All peers must share the same key. When set, connections are wrapped in
+   * an XSalsa20 stream cipher — peers without the key cannot communicate.
+   */
+  swarmKeyPath?: string;
 }
 
 /** Default configuration */
