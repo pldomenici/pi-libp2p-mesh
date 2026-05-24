@@ -402,11 +402,20 @@ export class MeshNode {
       stored.status = "connected";
       // Clear the disconnected timestamp if this is a reconnection
       stored.disconnectedAt = undefined;
+      // Merge addresses from the new connection (may have additional addresses)
+      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const remoteAddrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
+      const addrSet = new Set(stored.addresses);
+      for (const a of remoteAddrs) addrSet.add(a);
+      stored.addresses = [...addrSet];
     } else {
       // Inbound connection before mDNS discovery — create placeholder
+      // with addresses backfilled from the actual connection
+      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const addrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       this.peerStore.set(peerIdStr, {
         id: peerIdStr,
-        addresses: [],
+        addresses: addrs,
         status: "connected",
         discoveredAt: Date.now(),
       });
@@ -445,11 +454,20 @@ export class MeshNode {
     const stored = this.peerStore.get(peerIdStr);
     if (stored) {
       stored.agentName = agentName;
+      // Merge addresses from the new identify session (may have additional addresses)
+      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const remoteAddrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
+      const addrSet = new Set(stored.addresses);
+      for (const a of remoteAddrs) addrSet.add(a);
+      stored.addresses = [...addrSet];
     } else {
       // Identify before discovery/connect — create placeholder
+      // with addresses backfilled from the actual connection
+      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const addrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       this.peerStore.set(peerIdStr, {
         id: peerIdStr,
-        addresses: [],
+        addresses: addrs,
         status: "connected",
         discoveredAt: Date.now(),
         agentName,
