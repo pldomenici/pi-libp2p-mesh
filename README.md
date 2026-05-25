@@ -3,7 +3,7 @@
 > **P2P mesh network extension for [pi agents](https://github.com/earendil-works/pi-coding-agent) — peer discovery, direct messaging, and gossip broadcast.**  
 > Built on [libp2p](https://libp2p.io/), the modular peer-to-peer networking stack.
 
-[![npm version](https://img.shields.io/npm/v/@earendil-works/pi-libp2p-mesh)](https://www.npmjs.com/package/@earendil-works/pi-libp2p-mesh)
+[![npm version](https://img.shields.io/npm/v/pi-libp2p-mesh)](https://www.npmjs.com/package/pi-libp2p-mesh)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -27,21 +27,21 @@
 ## Installation
 
 ```bash
-npm install @earendil-works/pi-libp2p-mesh
+npm install pi-libp2p-mesh
 ```
 
 Then add the extension to your pi configuration (e.g., `~/.pi/config.json`):
 
 ```json
 {
-  "extensions": ["@earendil-works/pi-libp2p-mesh"]
+  "extensions": ["pi-libp2p-mesh"]
 }
 ```
 
 Or install it as a pi package:
 
 ```bash
-pi install @earendil-works/pi-libp2p-mesh
+pi install pi-libp2p-mesh
 ```
 
 ---
@@ -151,7 +151,7 @@ pi --agent-name my-agent --mesh-enable-dht
 
 ```bash
 # Clone
-git clone https://github.com/earendil-works/pi-libp2p-mesh.git
+git clone https://github.com/pldomenici/pi-libp2p-mesh.git
 cd pi-libp2p-mesh
 
 # Install dependencies
@@ -219,7 +219,7 @@ The mesh maintains an in-memory peer store that persists for the duration of the
 Pass a persistent Ed25519 private key via `MeshConfig.privateKey` to give an agent a stable PeerId across restarts:
 
 ```ts
-import { MeshNode } from '@earendil-works/pi-libp2p-mesh/node';
+import { MeshNode } from 'pi-libp2p-mesh/node';
 
 const node = await MeshNode.create({
   agentName: 'my-agent',
