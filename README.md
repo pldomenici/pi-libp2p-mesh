@@ -1,10 +1,14 @@
 # pi-libp2p-mesh
 
-> **P2P mesh network extension for [pi agents](https://github.com/earendil-works/pi-coding-agent) — peer discovery, direct messaging, and gossip broadcast.**  
+> **P2P mesh network extension for [pi agents](https://github.com/earendil-works/pi-coding-agent) — peer discovery, direct messaging, gossip broadcast, and persistent agent memory.**  
 > Built on [libp2p](https://libp2p.io/), the modular peer-to-peer networking stack.
 
 [![npm version](https://img.shields.io/npm/v/pi-libp2p-mesh)](https://www.npmjs.com/package/pi-libp2p-mesh)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+---
+
+> **📖 Full architecture document:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — module breakdowns, data flow diagrams, design decisions, and test suite details.
 
 ---
 
@@ -15,12 +19,19 @@
 - 📢 **GossipSub broadcast** for group announcements and coordination
 - 🔐 **End-to-end encryption** via Noise protocol
 - 🧹 **Automatic stale peer pruning** — old/restarted agents are cleaned up
-- 🔧 **Five custom tools** exposed to the LLM:
-  - `mesh_list_peers` — list all known peers
-  - `mesh_send` — send a direct message to a peer
-  - `mesh_broadcast` — broadcast to all peers
-  - `mesh_discover` — scan for new peers
-  - `mesh_prune` — remove stale/disconnected peers
+- 🧠 **Persistent agent memory** via ChromaDB — vector-backed storage with semantic recall across sessions
+- 🔧 **Nine LLM-callable tools:**
+  | Tool | Description |
+  |---|---|
+  | `mesh_list_peers` | List all known peers |
+  | `mesh_send` | Send a direct message to a peer |
+  | `mesh_broadcast` | Broadcast to all peers |
+  | `mesh_discover` | Scan for new peers |
+  | `mesh_prune` | Remove stale/disconnected peers |
+  | `memory_store` | Save a key-value memory entry for a peer |
+  | `memory_recall` | Recall memories for a peer by key |
+  | `memory_search` | Semantic search across stored memories |
+  | `memory_keys` | List memory keys for a peer |
 
 ---
 
@@ -81,20 +92,79 @@ mesh_discover
 mesh_prune
 ```
 
+### Save a memory
+```
+memory_store peerId="12D3KooW..." key="prefs" value="Prefers concise answers"
+```
+
+### Recall memories
+```
+memory_recall peerId="12D3KooW..." key="prefs"
+```
+
+### Semantic search across all memories
+```
+memory_search query="what do peers prefer?"
+```
+
 ---
 
 ## CLI Flags
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--agent-name` | string | `pi-<hostname>` | Agent name for the mesh (also reads `PI_MESH_NAME` env var) |
+| `--agent-name` | string | `pi-<hostname>` | Agent name for the mesh (also from `PI_MESH_NAME` env var) |
 | `--mesh-enable-dht` | boolean | `false` | Enable Kademlia DHT for wide-area peer discovery |
 | `--mesh-gossip-topic` | string | `pi-broadcast` | GossipSub topic for broadcast messages |
+| `--mesh-swarm-key` | string | — | Path to a `swarm.key` file for private P2P network (PSK) |
+| `--mesh-chroma-host` | string | `localhost` | ChromaDB server hostname (or `CHROMA_HOST` env var) |
+| `--mesh-chroma-port` | number | `8000` | ChromaDB server port (or `CHROMA_PORT` env var) |
+| `--mesh-chroma-token` | string | — | Auth token for ChromaDB (`x-chroma-token` header) |
+| `--mesh-memory-preset` | string | `large` | Memory limit preset: `small` (32K), `medium` (128K), `large` (1M) |
+| `--mesh-memory-max-entries` | number | — | Override hard max entries returned by `memory_recall` |
+| `--mesh-memory-truncate` | number | — | Override value truncation in chars for memory entries |
+| `--mesh-memory-budget` | number | — | Override auto-retrieve context budget in chars |
+| `--mesh-memory-exchange-truncate` | number | — | Override exchange truncation in chars |
+| `--mesh-memory-distance` | float | — | Override distance threshold for search filtering (default 0.6) |
 
 Example:
 
 ```bash
-pi --agent-name my-agent --mesh-enable-dht
+pi --agent-name my-agent --mesh-enable-dht --mesh-memory-preset medium
+```
+
+---
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `PI_MESH_NAME` | Agent name (overrides `--agent-name` flag) |
+| `PI_COMM_NAME` | Backward-compatible alias for agent name |
+| `PI_SWARM_KEY` | Path to a `swarm.key` file (alternative to `--mesh-swarm-key`) |
+| `CHROMA_HOST` | ChromaDB host (alternative to `--mesh-chroma-host`) |
+| `CHROMA_PORT` | ChromaDB port (alternative to `--mesh-chroma-port`) |
+| `CHROMA_TOKEN` | ChromaDB auth token (alternative to `--mesh-chroma-token`) |
+| `PI_MEMORY_PRESET` | Memory limit preset: `small`, `medium`, `large` |
+
+**Config priority:** CLI flag → environment variable → default
+
+---
+
+## Memory Presets
+
+All read-side memory limits can be set at once with `--mesh-memory-preset`:
+
+| Preset | Target model | Truncation | Max entries | Context budget | Exchange truncation |
+|---|---|---|---|---|---|
+| `small` | 32K tokens | 2,000 chars | 20 | 12,000 chars | 2,000 chars |
+| `medium` | 128K tokens | 5,000 chars | 30 | 25,000 chars | 3,000 chars |
+| `large` (default) | 1M tokens | 10,000 chars | 50 | 50,000 chars | 5,000 chars |
+
+Individual flags override specific preset values:
+
+```bash
+pi --mesh-memory-preset medium --mesh-memory-budget 50000
 ```
 
 ---
@@ -113,26 +183,57 @@ pi --agent-name my-agent --mesh-enable-dht
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   pi agent                           │
-│  ┌─────────────────────────────────────────────┐    │
-│  │        pi-libp2p-mesh extension              │    │
-│  │  ┌──────────┐  ┌────────────┐  ┌─────────┐  │    │
-│  │  │  node.ts │  │protocols.ts│  │ tools.ts│  │    │
-│  │  │ (libp2p) │  │ (msg/gossip)│  │ (tools)  │  │    │
-│  │  └──────────┘  └────────────┘  └─────────┘  │    │
-│  └─────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────┘
-         │                │
-    ┌────┴────┐    ┌──────┴──────┐
-    │  mDNS   │    │  GossipSub  │
-    │ discover│    │  broadcast  │
-    └─────────┘    └─────────────┘
-         │                │
-    ┌────┴────────────────┴────────────────┐
-    │         libp2p overlay network        │
-    │  (TCP + WebSocket / Noise / Yamux)    │
-    └───────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      pi agent process                            │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │                pi-libp2p-mesh extension                  │    │
+│  │                                                          │    │
+│  │  ┌───────────────┐    ┌────────────────┐                 │    │
+│  │  │   index.ts    │◄──►│   tools.ts     │                 │    │
+│  │  │  (lifecycle,  │    │  (9 LLM tools, │                 │    │
+│  │  │   FIFO queue, │    │   peer store,  │                 │    │
+│  │  │   event bus,  │    │   pruning)     │                 │    │
+│  │  │   memory hooks│    └───────┬────────┘                 │    │
+│  │  └───────┬───────┘            │                          │    │
+│  │          │             ┌──────▼────────┐                 │    │
+│  │          ├────────────►│ MeshProtocols │                 │    │
+│  │          │             │  · sendMessage│                 │    │
+│  │          │             │  · broadcast  │                 │    │
+│  │          │             │  · gossip sub │                 │    │
+│  │          │             └──────┬────────┘                 │    │
+│  │          │                    │                          │    │
+│  │          │             ┌──────▼────────┐                 │    │
+│  │          │             │   MeshNode    │                 │    │
+│  │          │             │  · libp2p     │                 │    │
+│  │          │             │  · transports │                 │    │
+│  │          │             │  · discovery  │                 │    │
+│  │          │             └───────────────┘                 │    │
+│  │          │                                               │    │
+│  │     ┌────▼─────────┐                                     │    │
+│  │     │  memory.ts   │                                     │    │
+│  │     │ · AgentMemory│                                     │    │
+│  │     │ · store()    │                                     │    │
+│  │     │ · search()   │                                     │    │
+│  │     └──────┬───────┘                                     │    │
+│  └────────────┼─────────────────────────────────────────────┘    │
+│               │                                                  │
+│  ┌────────────┴───────────────┐                                  │
+│  │      ChromaDB Server       │                                  │
+│  │   (localhost:8000, .chroma)│                                  │
+│  │                            │                                  │
+│  │  Collection: pi_memory_*   │                                  │
+│  │   · peerId → metadata      │                                  │
+│  │   · key → metadata         │                                  │
+│  │   · value → embed(document)│                                  │
+│  └────────────────────────────┘                                  │
+│                                                                  │
+│              ┌──────────┴──────────┐                             │
+│              │   libp2p overlay    │                             │
+│              │  TCP + WebSocket    │                             │
+│              │  Noise / Yamux      │                             │
+│              │  mDNS + DHT         │                             │
+│              └─────────────────────┘                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Module Structure
@@ -142,8 +243,26 @@ pi --agent-name my-agent --mesh-enable-dht
 | `src/types.ts` | Shared TypeScript types and interfaces |
 | `src/node.ts` | `MeshNode` — libp2p node factory & lifecycle |
 | `src/protocols.ts` | `MeshProtocols` — direct messaging & GossipSub |
-| `src/tools.ts` | Tool registration for pi's LLM integration |
-| `src/index.ts` | Extension entry point, lifecycle wiring |
+| `src/tools.ts` | Tool registration (5 mesh + 4 memory) for pi's LLM integration |
+| `src/memory.ts` | `AgentMemory` — ChromaDB-backed persistent memory, semantic search |
+| `src/index.ts` | Extension entry point, lifecycle wiring, FIFO request queue, memory hooks |
+
+---
+
+## Protocol Stack
+
+| Layer | Library | Purpose |
+|---|---|---|
+| **Transport** | `@libp2p/tcp` + `@libp2p/websockets` | Connection establishment |
+| **Encryption** | `@chainsafe/libp2p-noise` | End-to-end encryption |
+| **Multiplexing** | `@chainsafe/libp2p-yamux` | Multiple streams per connection |
+| **Discovery** | `@libp2p/mdns` (always on) | Local network peer discovery |
+| | `@libp2p/kad-dht` (optional) | Wide-area Kademlia-based discovery |
+| **Identity** | `@libp2p/identify` | Peer identity exchange (agent name, protocols) |
+| **Pub/Sub** | `@chainsafe/libp2p-gossipsub` | Topic-based broadcast messaging |
+| **Private Network** | `@libp2p/pnet` | Optional swarm key (PSK) for private P2P networks |
+| **Custom** | `/pi-agent/0.1.0` | Direct agent-to-agent CBOR-encoded messaging |
+| **Memory** | `chromadb` + `@chroma-core/default-embed` | Persistent agent memory, semantic search |
 
 ---
 
@@ -192,7 +311,7 @@ npm run watch
 
 | Suite | Tests | Result |
 |---|---|---|
-| Comprehensive (`test-network.mjs`) | 25 tests | ✅ All passing |
+| Comprehensive (`test-network.mjs`) | 26 tests | ✅ All passing |
 | Rigorous (`rigorous-concurrent-test.mjs`) | 82 tests (10 phases) | ✅ All passing |
 | FIFO Queue (`test-fifo-queue.mjs`) | 8 tests | ✅ All passing |
 | Stable Identity (`test-identity.mjs`) | 9 tests | ✅ All passing |
@@ -202,17 +321,6 @@ npm run watch
 ---
 
 ## Configuration
-
-### Environment Variables
-
-| Variable | Description |
-|---|---|
-| `PI_MESH_NAME` | Agent name (overrides `--agent-name` flag) |
-| `PI_COMM_NAME` | Backward-compatible alias for agent name |
-
-### Peer Persistence
-
-The mesh maintains an in-memory peer store that persists for the duration of the session. Stale peers (disconnected > 60s) are automatically pruned every 30 seconds. Use `mesh_prune` for immediate cleanup.
 
 ### Stable Peer Identity
 
@@ -226,6 +334,21 @@ const node = await MeshNode.create({
   privateKey: loadPersistedPrivateKey(), // Uint8Array
 });
 ```
+
+### Peer Persistence
+
+The mesh maintains an in-memory peer store that persists for the duration of the session. Stale peers (disconnected > 60s) are automatically pruned every 30 seconds. Use `mesh_prune` for immediate cleanup.
+
+### Memory Persistence
+
+ChromaDB data is stored on disk at `.chroma/`. Memories persist across agent restarts — on next `session_start`, the extension reconnects to the existing collection and all past memories are immediately available.
+
+---
+
+## Further Reading
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — comprehensive module breakdowns, data flow diagrams, design decisions
+- [`AGENT-MEMORY.md`](./AGENT-MEMORY.md) — LLM usage guide for the memory system
 
 ---
 

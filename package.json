@@ -87,7 +87,7 @@
     "chromadb": "^3.4.3",
     "libp2p": "^3.3.1",
     "multiformats": "^14.0.0",
-    "pi-libp2p-mesh": "^0.3.1",
+    "pi-libp2p-mesh": "^0.3.2",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
