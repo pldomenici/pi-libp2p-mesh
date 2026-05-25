@@ -48,6 +48,7 @@ const store: MeshStore = {
   peers: new Map(),
   broadcastHistory: [],
   agentName: "", // set during extension init after flag is read
+  peerId: "",    // set after mesh node starts
   autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
 };
 
@@ -553,6 +554,7 @@ export default async function (pi: ExtensionAPI) {
       meshNode.onEvent((ev) => handleNodeEvent(pi, ev));
 
       await meshNode.start();
+      store.peerId = meshNode.peerId;
 
       notify(pi, `Mesh node started as "${config.agentName}" (${meshNode.peerId})`);
 
@@ -777,11 +779,22 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const lines = peers.map((p) => {
+      // Sort: self first, then connected, then disconnected
+      const sorted = [...peers].sort((a, b) => {
+        if (a.id === store.peerId) return -1;
+        if (b.id === store.peerId) return 1;
+        if (a.status === "connected" && b.status !== "connected") return -1;
+        if (a.status !== "connected" && b.status === "connected") return 1;
+        return (a.agentName ?? "").localeCompare(b.agentName ?? "");
+      });
+
+      const lines = sorted.map((p) => {
         const icon = p.status === "connected" ? "🟢" : "🔴";
         const name = p.agentName ?? "unknown";
         const age = Math.round((Date.now() - p.discoveredAt) / 1000);
-        return `${icon} ${name} — ${p.id.slice(0, 16)}… (${p.status}, ${age}s ago)`;
+        const idDisplay = p.id;
+        const selfMarker = p.id === store.peerId ? " (SELF)" : "";
+        return `${icon} ${name} — ${idDisplay} (${p.status}, ${age}s ago)${selfMarker}`;
       });
 
       ctx.ui.notify(
@@ -814,11 +827,21 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const lines = peers.map((p) => {
+      // Sort: self first, then connected, then disconnected
+      const sorted = [...peers].sort((a, b) => {
+        if (a.id === store.peerId) return -1;
+        if (b.id === store.peerId) return 1;
+        if (a.status === "connected" && b.status !== "connected") return -1;
+        if (a.status !== "connected" && b.status === "connected") return 1;
+        return (a.agentName ?? "").localeCompare(b.agentName ?? "");
+      });
+
+      const lines = sorted.map((p) => {
         const icon = p.status === "connected" ? "🟢" : "🔴";
         const name = p.agentName ?? "unknown";
         const age = Math.round((Date.now() - p.discoveredAt) / 1000);
-        return `${icon} ${name} — ${p.id} (${p.status}, ${age}s ago)`;
+        const selfMarker = p.id === store.peerId ? " (SELF)" : "";
+        return `${icon} ${name} — ${p.id} (${p.status}, ${age}s ago)${selfMarker}`;
       });
 
       ctx.ui.notify(

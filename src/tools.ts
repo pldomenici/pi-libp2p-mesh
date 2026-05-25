@@ -39,6 +39,8 @@ export interface MeshStore {
   peers: Map<string, MeshPeer>;
   broadcastHistory: BroadcastMessage[];
   agentName: string;
+  /** This agent's own PeerId (set after mesh node starts) */
+  peerId: string;
   /** When true, all incoming messages auto-reply without involving the LLM. */
   autoReplyAll: boolean;
 }
@@ -154,12 +156,21 @@ export interface PeerListResult {
   total: number;
 }
 
-/** Get current peer list after pruning stale entries. */
+/** Get current peer list after pruning stale entries, including self. */
 export function listPeers(store: MeshStore): PeerListResult {
   pruneStalePeers(store);
   const peers = [...store.peers.values()];
-  const connected = peers.filter((p) => p.status === "connected").length;
-  return { peers, connected, total: peers.length };
+  // Include self in the peer list so the agent sees its own PeerId
+  const selfPeer: MeshPeer = {
+    id: store.peerId,
+    addresses: ["self"],
+    status: "connected",
+    agentName: store.agentName,
+    discoveredAt: Date.now(),
+  };
+  const allPeers = [selfPeer, ...peers];
+  const connected = allPeers.filter((p) => p.status === "connected").length;
+  return { peers: allPeers, connected, total: allPeers.length };
 }
 
 // ── Tool Registration ────────────────────────────────────────────────────────
@@ -173,25 +184,36 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
     name: "mesh_list_peers",
     label: "List Mesh Peers",
     description:
-      "List all known peers on the P2P mesh network, including their connection status, addresses, and agent names.",
+      "List all peers on the P2P mesh network (including self), with connection status, addresses, and agent names.",
     promptSnippet: "List peers on the libp2p mesh network",
     promptGuidelines: [
-      "Use mesh_list_peers to see what other pi agents are available before sending messages on the mesh.",
+      "Use mesh_list_peers to see all peers (including your own PeerId) before sending messages on the mesh.",
     ],
     parameters: Type.Object({}),
 
     async execute() {
       const { peers, connected, total } = listPeers(store);
 
+      // Sort: self first, then connected, then disconnected
+      const sorted = [...peers].sort((a, b) => {
+        if (a.id === store.peerId) return -1;
+        if (b.id === store.peerId) return 1;
+        if (a.status === "connected" && b.status !== "connected") return -1;
+        if (a.status !== "connected" && b.status === "connected") return 1;
+        return (a.agentName ?? "").localeCompare(b.agentName ?? "");
+      });
+
       const text =
         total === 0
           ? "No peers discovered yet. Peer discovery runs automatically via mDNS in the background — ensure other pi agents with pi-libp2p-mesh are running on the same network."
           : `Found ${connected} connected / ${total} total peers:\n\n` +
-            peers
+            sorted
               .map((p) => {
                 const name = p.agentName ?? "unknown";
                 const addrs = p.addresses.join(", ") || "none";
-                return `  ${p.status === "connected" ? "🟢" : "🔴"} **${name}** (${p.id}) — ${addrs}`;
+                const icon = p.status === "connected" ? "🟢" : "🔴";
+                const line = `  ${icon} **${name}** (${p.id}) — ${addrs}`;
+                return p.id === store.peerId ? `**${line}**` : line;
               })
               .join("\n");
 
@@ -458,15 +480,26 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         peers,
       };
 
+      // Sort: self first, then connected, then disconnected
+      const sorted = [...peers].sort((a, b) => {
+        if (a.id === store.peerId) return -1;
+        if (b.id === store.peerId) return 1;
+        if (a.status === "connected" && b.status !== "connected") return -1;
+        if (a.status !== "connected" && b.status === "connected") return 1;
+        return (a.agentName ?? "").localeCompare(b.agentName ?? "");
+      });
+
       const text =
         total === 0
           ? "No peers known. Peer discovery via mDNS runs in the background — ensure other pi agents with pi-libp2p-mesh are running on the same network."
           : `${connected}/${total} peer(s):\n\n` +
-            peers
+            sorted
               .map((p) => {
                 const name = p.agentName ?? "unnamed";
                 const age = Math.round((Date.now() - p.discoveredAt) / 1000);
-                return `  ${p.status === "connected" ? "🟢" : "🔴"} **${name}** — ${p.id} (${p.status}, ${age}s ago)`;
+                const icon = p.status === "connected" ? "🟢" : "🔴";
+                const line = `  ${icon} **${name}** — ${p.id} (${p.status}, ${age}s ago)`;
+                return p.id === store.peerId ? `**${line}**` : line;
               })
               .join("\n");
 

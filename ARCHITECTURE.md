@@ -342,7 +342,7 @@ autoReply === true?
 
 | Tool | Description | Parameters |
 |---|---|---|
-| `mesh_list_peers` | List all known peers with status, addresses, agent names | `{}` |
+| `mesh_list_peers` | List all peers (including self) with status, addresses, agent names | `{}` |
 | `mesh_send` | Send a direct message to a peer, await their response | `peerId: string`, `message: string`, `autoReply?: boolean` |
 | `mesh_broadcast` | Publish a GossipSub broadcast | `message: string`, `type?: "announce" \| "query" \| "response" \| "event"` |
 | `mesh_discover` | Scan for new peers, report recently discovered | `{}` |
