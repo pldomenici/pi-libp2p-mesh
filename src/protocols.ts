@@ -328,6 +328,43 @@ export class MeshProtocols {
   }
 
   /**
+   * Subscribe to an arbitrary GossipSub topic with a raw CBOR-decode callback.
+   * Used for non-agent messages like memory host announcements.
+   */
+  subscribeRawTopic<T>(topic: string, onMessage: (msg: T, fromPeerId: string) => void): void {
+    const pubsub = this.resolvePubsub();
+    if (pubsub == null) {
+      console.warn(`[mesh-protocols] GossipSub not available — cannot subscribe to "${topic}"`);
+      return;
+    }
+    pubsub.subscribe(topic);
+    (pubsub as any).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
+      const gMsg = event.detail;
+      // We only handle messages for our specific topic
+      if ((gMsg.msg as any).topic !== topic) return;
+      try {
+        const decoded = decode(gMsg.msg.data) as T;
+        // Skip our own messages (GossipSub delivers to publisher too)
+        if ((decoded as any).fromPeerId === this.libp2p.peerId.toString()) return;
+        onMessage(decoded, (gMsg.msg as any).from?.toString?.() ?? "");
+      } catch (err) {
+        console.warn(`[mesh-protocols] Failed to decode message on "${topic}":`, err);
+      }
+    });
+  }
+
+  /**
+   * Publish an arbitrary CBOR-encoded message on a GossipSub topic.
+   */
+  async publishRawTopic<T>(topic: string, message: T): Promise<void> {
+    const pubsub = this.resolvePubsub();
+    if (pubsub == null) {
+      throw new Error("GossipSub not available");
+    }
+    await pubsub.publish(topic, encode(message as any));
+  }
+
+  /**
    * Gracefully shut down all protocol handlers.
    *
    * - Unregisters the `/pi-agent/0.1.0` stream handler.
@@ -436,8 +473,13 @@ export class MeshProtocols {
     event: CustomEvent<GossipsubMessage>,
   ): Promise<void> {
     const { msg: message } = event.detail;
-    const broadcastMsg: BroadcastMessage = decode(message.data) as BroadcastMessage;
 
+    // Only handle the main broadcast topic — other topics (e.g. memory host
+    // announcements) are handled by their own subscribeRawTopic listeners.
+    const topic = this.config.gossipTopic ?? 'pi-broadcast';
+    if ((message as any).topic !== topic) return;
+
+    const broadcastMsg: BroadcastMessage = decode(message.data) as BroadcastMessage;
     this._onBroadcast?.(broadcastMsg);
   }
 

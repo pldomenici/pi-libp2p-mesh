@@ -27,6 +27,7 @@ import { MeshNode } from "./node.js";
 import { MeshProtocols } from "./protocols.js";
 import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemory, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
 import { AgentMemory, resolveMemoryConfig } from "./memory.js";
+import { ChromaDBLifecycle } from "./chroma-lifecycle.js";
 import os from "node:os";
 
 /** Extension version — reported via Identify protocol for stale-build detection. */
@@ -39,6 +40,8 @@ export const EXTENSION_VERSION = "0.3.0";
 let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
 let agentMemory: AgentMemory | null = null;
+let chromaLifecycle: ChromaDBLifecycle | null = null;
+let memoryHostAnnounceInterval: ReturnType<typeof setInterval> | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
 const store: MeshStore = {
@@ -68,6 +71,18 @@ function parseOptionalFloat(val: unknown): number | undefined {
   return Number.isNaN(n) ? undefined : n;
 }
 
+/** Extract the first non-loopback IPv4 address from the libp2p node's multiaddrs. */
+function resolveLocalIp(libp2p: any): string | null {
+  try {
+    const addrs: string[] = libp2p.getMultiaddrs?.()?.map((m: any) => m.toString()) ?? [];
+    for (const addr of addrs) {
+      const m = addr.match(/\/ip4\/(\d+\.\d+\.\d+\.\d+)/);
+      if (m && m[1] !== "127.0.0.1") return m[1];
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
 function buildConfig(pi: ExtensionAPI): MeshConfig {
   const swarmKeyPath =
     (pi.getFlag("mesh-swarm-key") as string) ||
@@ -85,6 +100,8 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
     chromaPort: parseOptionalInt(pi.getFlag("mesh-chroma-port") as string) ??
       (process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : undefined),
     chromaToken: (pi.getFlag("mesh-chroma-token") as string) || process.env.CHROMA_TOKEN || undefined,
+    chromaDataPath: (pi.getFlag("mesh-chroma-data-path") as string) ||
+      process.env.CHROMA_DATA_PATH || undefined,
   };
 }
 
@@ -221,6 +238,13 @@ export default async function (pi: ExtensionAPI) {
     type: "string",
     default: "",
   });
+  pi.registerFlag("mesh-chroma-data-path", {
+    description:
+      "ChromaDB data directory for persistence (default: ~/.local/share/chroma). " +
+      "Also CHROMA_DATA_PATH env var.",
+    type: "string",
+    default: "",
+  });
   pi.registerFlag("mesh-memory-preset", {
     description:
       "Memory limit preset: small (32K), medium (128K), large 1M (default). " +
@@ -282,26 +306,6 @@ export default async function (pi: ExtensionAPI) {
       distance: parseOptionalFloat(pi.getFlag("mesh-memory-distance")) ??
         (process.env.PI_MEMORY_DISTANCE ? Number(process.env.PI_MEMORY_DISTANCE) : undefined),
     });
-
-    // Initialize AgentMemory (non-blocking on failure)
-    try {
-      agentMemory = await AgentMemory.create({
-        host: config.chromaHost ?? "localhost",
-        port: config.chromaPort ?? 8000,
-        token: config.chromaToken,
-        agentName: store.agentName,
-        config: memoryConfig,
-      });
-      setAgentMemory(agentMemory);
-      notify(pi, `Memory connected — collection "${agentMemory.collectionName}"`);
-      ctx.ui.notify(`🧠 ChromaDB memory active — collection "${agentMemory.collectionName}"`, "info");
-    } catch (err: any) {
-      const reason = err.message || String(err);
-      console.warn(`[pi-libp2p-mesh] Memory initialization failed — memory tools disabled for this session: ${reason}`);
-      ctx.ui.notify(`⚠️ ChromaDB memory unavailable: ${reason}. Memory tools disabled.`, "warning");
-      agentMemory = null;
-      setAgentMemory(null);
-    }
 
     try {
       meshNode = await MeshNode.create(config, EXTENSION_VERSION);
@@ -552,6 +556,105 @@ export default async function (pi: ExtensionAPI) {
 
       notify(pi, `Mesh node started as "${config.agentName}" (${meshNode.peerId})`);
 
+      // ── ChromaDB Host Election ───────────────────────────────────────
+      // First node to start becomes the host. Others connect to it.
+      // Discovery is via GossipSub on the "pi-memory-host" topic.
+      const defaultHost = config.chromaHost ?? "localhost";
+      const defaultPort = config.chromaPort ?? 8000;
+      let resolvedHost = defaultHost;
+      let resolvedPort = defaultPort;
+      let isMemoryHost = false;
+      let hostDiscovered = false;
+
+      // Resolve the local IP we'll advertise if we become the host
+      const localIp = resolveLocalIp(meshNode.libp2p);
+
+      // Subscribe to host announcements from other peers
+      meshProtocols.subscribeRawTopic<import("./types.js").MemoryHostAnnouncement>(
+        "pi-memory-host",
+        (announcement) => {
+          hostDiscovered = true;
+          resolvedHost = announcement.host;
+          resolvedPort = announcement.port;
+          notify(pi, `Discovered ChromaDB host: ${announcement.fromAgent} at ${announcement.host}:${announcement.port}`);
+        },
+      );
+
+      chromaLifecycle = new ChromaDBLifecycle({
+        host: defaultHost,
+        port: defaultPort,
+        token: config.chromaToken,
+        dataPath: config.chromaDataPath,
+      });
+
+      // First check if ChromaDB is already running locally
+      const localRunning = await chromaLifecycle.isRunning();
+
+      if (localRunning) {
+        // ChromaDB already on localhost — we're the host. Announce it.
+        resolvedHost = localIp ?? defaultHost;
+        resolvedPort = defaultPort;
+        isMemoryHost = true;
+        notify(pi, `ChromaDB already running locally — announcing as host at ${resolvedHost}:${resolvedPort}`);
+        const announcement: import("./types.js").MemoryHostAnnouncement = {
+          type: "memory:host",
+          host: resolvedHost,
+          port: resolvedPort,
+          fromAgent: store.agentName,
+          fromPeerId: meshNode.peerId,
+          timestamp: Date.now(),
+        };
+        await meshProtocols.publishRawTopic("pi-memory-host", announcement);
+      } else {
+        // No local ChromaDB — wait briefly for an existing host announcement
+        await new Promise((r) => setTimeout(r, hostDiscovered ? 0 : 2500));
+
+        if (hostDiscovered) {
+          notify(pi, `Connecting to mesh ChromaDB host at ${resolvedHost}:${resolvedPort}`);
+        } else {
+          // No host found — we become the host
+          notify(pi, `No ChromaDB host found — becoming the host…`);
+          const started = await chromaLifecycle.ensureRunning();
+          if (started) {
+            resolvedHost = localIp ?? defaultHost;
+            resolvedPort = defaultPort;
+            isMemoryHost = true;
+            const announcement: import("./types.js").MemoryHostAnnouncement = {
+              type: "memory:host",
+              host: resolvedHost,
+              port: resolvedPort,
+              fromAgent: store.agentName,
+              fromPeerId: meshNode.peerId,
+              timestamp: Date.now(),
+            };
+            await meshProtocols.publishRawTopic("pi-memory-host", announcement);
+          } else {
+            console.warn("[pi-libp2p-mesh] Failed to start ChromaDB locally — memory tools disabled");
+          }
+        }
+      }
+
+      // ── Initialize AgentMemory ───────────────────────────────────────
+      try {
+        agentMemory = await AgentMemory.create({
+          host: resolvedHost,
+          port: resolvedPort,
+          token: config.chromaToken,
+          agentName: store.agentName,
+          config: memoryConfig,
+        });
+        setAgentMemory(agentMemory);
+        const role = isMemoryHost ? "(host)" : "";
+        notify(pi, `Memory connected ${role} — collection "${agentMemory.collectionName}" at ${resolvedHost}:${resolvedPort}`);
+        ctx.ui.notify(`🧠 ChromaDB memory active — collection "${agentMemory.collectionName}" ${role}`, "info");
+      } catch (err: any) {
+        const reason = err.message || String(err);
+        console.warn(`[pi-libp2p-mesh] Memory initialization failed — memory tools disabled for this session: ${reason}`);
+        ctx.ui.notify(`⚠️ ChromaDB memory unavailable: ${reason}. Memory tools disabled.`, "warning");
+        agentMemory = null;
+        setAgentMemory(null);
+      }
+
       // Background stale-peer pruning — runs every 30s to keep the peer
       // table clean without explicit LLM-triggered prune commands.
       pruneInterval = setInterval(() => {
@@ -560,6 +663,24 @@ export default async function (pi: ExtensionAPI) {
           notify(pi, `Background prune: removed ${removed} stale peer(s)`);
         }
       }, 30_000);
+
+      // Periodic ChromaDB host re-announcement — ensures late joiners
+      // and nodes that missed the initial announcement can discover us.
+      if (isMemoryHost) {
+        memoryHostAnnounceInterval = setInterval(() => {
+          const announcement: import("./types.js").MemoryHostAnnouncement = {
+            type: "memory:host",
+            host: resolvedHost,
+            port: resolvedPort,
+            fromAgent: store.agentName,
+            fromPeerId: meshNode!.peerId,
+            timestamp: Date.now(),
+          };
+          meshProtocols!.publishRawTopic("pi-memory-host", announcement).catch((err) =>
+            console.warn("[pi-libp2p-mesh] Failed to re-announce ChromaDB host:", err),
+          );
+        }, 10_000);
+      }
 
       ctx.ui.notify(
         `libp2p mesh online — ${meshNode.peerId}`,
@@ -577,6 +698,11 @@ export default async function (pi: ExtensionAPI) {
       clearInterval(pruneInterval);
       pruneInterval = null;
     }
+    // Stop memory host re-announcement
+    if (memoryHostAnnounceInterval) {
+      clearInterval(memoryHostAnnounceInterval);
+      memoryHostAnnounceInterval = null;
+    }
     if (meshProtocols) {
       await meshProtocols.stop();
     }
@@ -590,6 +716,10 @@ export default async function (pi: ExtensionAPI) {
       await agentMemory.stop();
       agentMemory = null;
       setAgentMemory(null);
+    }
+    if (chromaLifecycle) {
+      chromaLifecycle.stop();
+      chromaLifecycle = null;
     }
     // Clear all peer and broadcast state so the next session starts fresh
     // (the module-level store survives across session restarts because

@@ -39,6 +39,7 @@
   "files": [
     "dist/",
     "src/",
+    "scripts/",
     "index.ts",
     "README.md",
     "ARCHITECTURE.md",
@@ -51,6 +52,7 @@
     "watch": "tsc --watch",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
+    "postinstall": "node scripts/postinstall.mjs",
     "test": "npx tsx test-network.mjs",
     "test:rigorous": "npx tsx rigorous-concurrent-test.mjs",
     "test:extension": "npx tsx test-extension.mjs",

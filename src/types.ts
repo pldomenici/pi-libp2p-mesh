@@ -119,6 +119,8 @@ export interface MeshConfig {
   chromaPort?: number;
   /** Optional auth token for ChromaDB (x-chroma-token header). Also CHROMA_TOKEN env var. */
   chromaToken?: string;
+  /** Optional data directory for ChromaDB persistence (default: ~/.local/share/chroma). */
+  chromaDataPath?: string;
 }
 
 /** Default configuration */
@@ -234,4 +236,24 @@ export interface MemorySearchResult extends MemoryEntry {
 export interface MemoryKeyEntry {
   key: string;
   count: number;
+}
+
+// ── Memory Host Discovery (GossipSub) ─────────────────────────────────────
+
+/**
+ * Broadcast on the "pi-memory-host" GossipSub topic by the first node
+ * that starts ChromaDB. All other nodes connect to this host.
+ */
+export interface MemoryHostAnnouncement {
+  type: "memory:host";
+  /** IP or hostname of the ChromaDB server. */
+  host: string;
+  /** Port the ChromaDB server is listening on. */
+  port: number;
+  /** Agent name of the host node. */
+  fromAgent: string;
+  /** PeerId of the host node. */
+  fromPeerId: string;
+  /** Timestamp of the announcement (epoch ms). */
+  timestamp: number;
 }

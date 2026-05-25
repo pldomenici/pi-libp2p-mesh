@@ -1,8 +1,8 @@
 # pi-libp2p-mesh — Architecture
 
-> **Last updated:** 2026-05-24  
-> **Package:** `pi-libp2p-mesh` v0.3.0  
-> **Lines of code:** ~1,680 TypeScript across 5 source files (pre-memory), ~2,200 including memory module
+> **Last updated:** 2026-05-25  
+> **Package:** `pi-libp2p-mesh` v0.3.3  
+> **Lines of code:** ~2,500 TypeScript across 7 source files
 
 ---
 
@@ -16,6 +16,7 @@
    - [protocols.ts — MeshProtocols (Messaging)](#protocolsts--meshprotocols-messaging)
    - [tools.ts — LLM Tools](#toolsts--llm-tools)
    - [memory.ts — AgentMemory (ChromaDB)](#memoryts--agentmemory-chromadb)
+   - [chroma-lifecycle.ts — ChromaDB Process Management](#chroma-lifecyclets--chromadb-process-management)
    - [types.ts — Shared Types](#typests--shared-types)
 4. [Data Flow](#data-flow)
    - [Direct Message Flow (`mesh_send`)](#direct-message-flow-mesh_send)
@@ -25,6 +26,7 @@
    - [Memory Retrieval Flow](#memory-retrieval-flow)
 5. [Protocol Stack](#protocol-stack)
 6. [Lifecycle](#lifecycle)
+   - [ChromaDB Host Election](#chromadb-host-election)
 7. [State Management](#state-management)
 8. [Design Decisions & Fixes](#design-decisions--fixes)
 9. [Configuration & CLI Flags](#configuration--cli-flags)
@@ -55,71 +57,60 @@ The extension runs as a singleton within each pi agent process. Every agent that
 ## High-Level Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                         pi agent process                          │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │              pi-libp2p-mesh extension                       │  │
-│  │                                                             │  │
-│  │  ┌───────────────┐    ┌────────────────┐                    │  │
-│  │  │   index.ts    │◄──►│   tools.ts     │                    │  │
-│  │  │  (lifecycle,  │    │  (8 LLM tools, │                    │  │
-│  │  │   FIFO queue, │    │   peer store,  │                    │  │
-│  │  │   event bus,  │    │   pruning,     │                    │  │
-│  │  │   commands,   │    │   memory tools)│                    │  │
-│  │  │   memory hooks│    └───────┬────────┘                    │  │
-│  │  └───────┬───────┘           │                              │  │
-│  │          │            ┌──────▼────────┐                     │  │
-│  │          ├───────────►│ MeshProtocols │                     │  │
-│  │          │            │  · sendMessage│                     │  │
-│  │          │            │  · broadcast  │                     │  │
-│  │          │            │  · gossip sub │                     │  │
-│  │          │            └──────┬────────┘                     │  │
-│  │          │                   │                               │  │
-│  │          │            ┌──────▼────────┐                     │  │
-│  │          │            │   MeshNode    │                     │  │
-│  │          │            │  · libp2p     │                     │  │
-│  │          │            │  · transports │                     │  │
-│  │          │            │  · discovery  │                     │  │
-│  │          │            │  · peer store │                     │  │
-│  │          │            └───────────────┘                     │  │
-│  │          │                                                  │  │
-│  │     ┌────▼─────────┐                                        │  │
-│  │     │  memory.ts   │                                        │  │
-│  │     │ · AgentMemory│                                        │  │
-│  │     │ · store()    │                                        │  │
-│  │     │ · retrieve() │                                        │  │
-│  │     │ · search()   │                                        │  │
-│  │     └──────┬───────┘                                        │  │
-│  │            │                                                │  │
-│  └────────────┼────────────────────────────────────────────────┘  │
-│               │                                                   │
-│  ┌────────────┴───────────────┐                                   │
-│  │      ChromaDB Server       │                                   │
-│  │   (localhost:8000, .chroma)│                                   │
-│  │                            │                                   │
-│  │  Collection: pi_memory_*   │                                   │
-│  │   · peerId → metadata      │                                   │
-│  │   · key → metadata         │                                   │
-│  │   · value → document (embed)│                                  │
-│  └────────────────────────────┘                                   │
-│                                                                   │
-│              ┌──────────┴──────────┐                              │
-│              │   libp2p overlay    │                              │
-│              │  TCP + WebSocket    │                              │
-│              │  Noise / Yamux      │                              │
-│              │  mDNS + DHT         │                              │
-│              └─────────────────────┘                              │
-└───────────────────────────────────────────────────────────────────┘
+┌─────────────────── Mesh Network ────────────────────┐
+│                                                     │
+│  ┌── Agent A ─────────────────────────────────────┐ │
+│  │  ┌──────────────┐  ┌────────┐  ┌─────────────┐ │ │
+│  │  │  index.ts    │◄─┤tools.ts│  │ memory.ts   │ │ │
+│  │  │  lifecycle,  │  │ 9 tools│  │ AgentMemory │ │ │
+│  │  │  FIFO queue, │  └────────┘  │ ChromaDB    │ │ │
+│  │  │  host elect. │              │ client      │ │ │
+│  │  └──────┬───────┘              └──────┬──────┘ │ │
+│  │         │                            │         │ │
+│  │  ┌──────▼────────┐  ┌────────────────┘         │ │
+│  │  │ MeshProtocols │  │                          │ │
+│  │  │  · sendMessage│  │                          │ │
+│  │  │  · broadcast  │  │                          │ │
+│  │  │  · raw topic  │  │                          │ │
+│  │  └──────┬────────┘  │                          │ │
+│  │         │           │                          │ │
+│  │  ┌──────▼────────┐  │                          │ │
+│  │  │   MeshNode    │  │                          │ │
+│  │  │  · libp2p     │  │                          │ │
+│  │  └───────────────┘  │                          │ │
+│  └─────────────────────┼──────────────────────────┘ │
+│                        ▼                            │
+│  ┌──────────────── ChromaDB ──────────────────────┐ │
+│  │  (one instance, first node hosts)              │ │
+│  │  ┌────────────────────────────┐                │ │
+│  │  │ pi_memory_*  collection    │                │ │
+│  │  │ · all agents share this    │                │ │
+│  │  └────────────────────────────┘                │ │
+│  └────────────────────────────────────────────────┘ │
+│                                                     │
+│  ┌── Agent B ─────────────────────────────────────┐ │
+│  │  (same structure, connects to  Agent A's       │ │
+│  │   ChromaDB via mesh-discovered host)           │ │
+│  └────────────────────────────────────────────────┘ │
+│                                                     │
+│              ┌──────────┴──────────┐                │
+│              │   libp2p overlay    │                │
+│              │  TCP + WebSocket    │                │
+│              │  Noise / Yamux      │                │
+│              │  mDNS + DHT         │                │
+│              └─────────────────────┘                │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### Dependency Graph
 
 ```
 index.ts
-  ├── node.ts ────────── types.ts
+  ├── node.ts ───────── types.ts
   ├── protocols.ts ───── types.ts
   ├── tools.ts ───────── types.ts, protocols.ts (type only), memory.ts (type only)
-  └── memory.ts ──────── types.ts (type only)
+  ├── memory.ts ──────── types.ts (type only)
+  └── chroma-lifecycle.ts ── (standalone — process management)
 ```
 
 ---
@@ -138,14 +129,16 @@ index.ts
    - Resolves agent name (CLI flag → `PI_MESH_NAME` env var → `PI_COMM_NAME` env var → `pi-<hostname>`)
    - Creates `MeshNode` (libp2p node)
    - Creates `MeshProtocols` (message handler)
-   - **NEW: Initializes `AgentMemory`** — connects to ChromaDB, gets/creates `pi_memory_{agentName}` collection
    - Sets up the **FIFO LLM request queue** (see [LLM Request Queue](#llm-request-queue-fifo))
-   - **NEW: Injects memory context** into incoming requests (auto-retrieves relevant memories about the requesting peer)
-   - **NEW: Saves memory** after LLM responds (auto-saves exchanges)
+   - Starts the node (begin listening, discovery)
+   - Runs **ChromaDB host election** — subscribes to `pi-memory-host` topic, starts ChromaDB if first node, connects to existing host otherwise
+   - **Initializes `AgentMemory`** — connects to ChromaDB at the resolved host/port, gets/creates `pi_memory_{agentName}` collection
+   - Injects memory context into incoming requests (auto-retrieves relevant memories about the requesting peer)
+   - Saves memory after LLM responds (auto-saves exchanges)
    - Wires event handlers (peer discovery, connect, disconnect, identify, message, broadcast)
    - Wires inbound broadcasts to `pi.sendUserMessage()` so the LLM sees them
    - Starts background stale-peer pruning (every 30s)
-3. **`session_shutdown` handler** — stops the node, cancels pruning timer, tears down protocols, closes ChromaDB connection
+3. **`session_shutdown` handler** — stops the node, cancels pruning timer, tears down protocols, stops ChromaDB child process, closes ChromaDB connection
 4. **Command Registration** — `/mesh-auto-reply`, `/mesh-list-peers`, `/mesh-discover`, `/mesh-prune`
 5. **Delegates tool registration** to `registerMeshTools()` in `tools.ts` and `registerMemoryTools()` in `tools.ts`
 
@@ -156,6 +149,7 @@ index.ts
 | `meshNode` | `MeshNode \| null` | Active libp2p node |
 | `meshProtocols` | `MeshProtocols \| null` | Active protocol handler |
 | `agentMemory` | `AgentMemory \| null` | Active ChromaDB-backed memory store |
+| `chromaLifecycle` | `ChromaDBLifecycle \| null` | ChromaDB child process manager |
 | `pruneInterval` | `setInterval` handle | Background pruning timer |
 | `store` | `MeshStore` | Shared peer registry, broadcast history, agent name, auto-reply flag |
 
@@ -163,25 +157,34 @@ index.ts
 
 ```
 session_start:
+  // ── Phase 1: Start mesh (needed for host election) ──
+  1. meshNode = await MeshNode.create(config)
+  2. meshProtocols = new MeshProtocols(node.libp2p, config)
+  3. await meshNode.start()
+
+  // ── Phase 2: ChromaDB host election ──
+  4. meshProtocols.subscribeRawTopic("pi-memory-host", ...)
+  5. if (localhost:port already running) → announce self as host
+     else: wait 2.5s for host announcement via GossipSub
+       found → resolvedHost = discovered host
+       not found → start ChromaDB, announce self as host
+
+  // ── Phase 3: Connect to ChromaDB ──
   // Resolve memory config: preset → individual overrides → defaults
   // Priority: CLI flag > env var > preset default
-  // Example: --mesh-memory-preset medium --mesh-memory-budget 50000
-  //   → medium preset values for all limits, except budget=50000
   const memoryConfig = resolveMemoryConfig(pi);
 
-  1. agentMemory = await AgentMemory.create({
-       host, port, 
+  6. agentMemory = await AgentMemory.create({
+       host: resolvedHost, port: resolvedPort,
        agentName: store.agentName,
        config: memoryConfig
      })
-     → If ChromaDB is unreachable at startup:
+     → If ChromaDB is unreachable:
         - Log a warning: "ChromaDB unreachable — memory disabled for this session"
         - agentMemory is set to null
         - Mesh operates normally; auto-save/auto-retrieve are no-ops
         - Memory tools return "Memory not available" errors
-        - The agent can still use all mesh tools
      → If connected: gets/creates pi_memory_{agentName} collection
-     → all read-side limits come from memoryConfig
 
 turn_end (FIFO queue → after extractResponseText):
   2. if (agentMemory) {
@@ -631,6 +634,31 @@ async search(query: string, opts?: { peerId?: string; nResults?: number; fullTex
 
 ---
 
+### chroma-lifecycle.ts — ChromaDB Process Management
+
+**Path:** `src/chroma-lifecycle.ts` (NEW)  
+**Exports:** `ChromaDBLifecycle` class
+
+**Role:** Manages the ChromaDB server as a child process. Handles starting, stopping, health-checking, and binary discovery.
+
+**Key API:**
+
+```typescript
+class ChromaDBLifecycle {
+  constructor(config: { host: string; port: number; token?: string; dataPath?: string });
+
+  isRunning(): Promise<boolean>;     // Health check via /api/v2/heartbeat
+  ensureRunning(): Promise<boolean>; // Start ChromaDB if not running (localhost only)
+  stop(): void;                      // SIGTERM the child process
+}
+```
+
+**Binary discovery:** Searches `PATH`, `~/.local/bin/`, and platform-specific pip locations (macOS, Windows).
+
+**Start behavior:** Spawns `chroma run --host 0.0.0.0 --path <dataDir> --port <port>`, waits up to 15s for readiness, kills on timeout.
+
+---
+
 ### types.ts — Shared Types
 
 **Path:** `src/types.ts`
@@ -882,6 +910,7 @@ LLM needs context about a peer
 | **Pub/Sub** | `@chainsafe/libp2p-gossipsub` | Topic-based broadcast messaging |
 | **Private Network** | `@libp2p/pnet` | Optional swarm key (PSK) for private P2P networks — all peers must share the same key |
 | **Custom** | `/pi-agent/0.1.0` (custom protocol) | Direct agent-to-agent CBOR-encoded messaging |
+| | `/pi-memory-host` (GossipSub topic) | ChromaDB host discovery — first node announces, others connect |
 | **Memory / Vector DB** | `chromadb` + `@chroma-core/default-embed` | Persistent agent memory, semantic search, embedding storage |
 
 **Identity:** Each agent gets an Ed25519 keypair. By default, a new keypair is generated per session, resulting in a new PeerId each time. Passing `config.privateKey` (a 32-byte seed) gives the agent **stable identity** across restarts — the PeerId is deterministically derived from the seed.
@@ -899,32 +928,61 @@ pi agent starts
   │    └─ register tools (mesh + memory)
   │
   ├─ session_start event
-  │    ├─ resolve agentName
-  │    ├─ AgentMemory.create(host, port, agentName)
-  │    │    ├─ new DefaultEmbeddingFunction()
-  │    │    ├─ new ChromaClient({ host, port })
-  │    │    ├─ client.getOrCreateCollection("pi_memory_{agentName}")
-  │    │    └─ ready for store/retrieve/search
-  │    ├─ MeshNode.create(config)        → generate keypair, create libp2p
-  │    ├─ new MeshProtocols(node)        → register /pi-agent/0.1.0, subscribe GossipSub
+  │    ├─ resolve agentName, config
+  │    ├─ MeshNode.create(config)             → generate keypair, create libp2p
+  │    ├─ new MeshProtocols(node)             → register /pi-agent/0.1.0, subscribe GossipSub
   │    ├─ wire onMessage / onRequest / onBroadcast callbacks
   │    ├─ register ONE turn_end listener (FIFO queue dequeue + memory save)
-  │    ├─ node.start()                   → begin listening, discovery
-  │    └─ setInterval(prune, 30_000)     → background stale cleanup
+  │    ├─ node.start()                        → begin listening, discovery
+  │    │
+  │    ├─ 🔍 ChromaDB Host Election (see below)
+  │    │    ├─ Subscribe "pi-memory-host" topic
+  │    │    ├─ Check localhost:port for existing ChromaDB
+  │    │    ├─ Wait 2.5s for host announcement
+  │    │    ├─ If found: connect to remote host
+  │    │    └─ If not: start ChromaDB locally, announce via GossipSub
+  │    │
+  │    ├─ AgentMemory.create(resolvedHost, resolvedPort, agentName)
+  │    │    ├─ new DefaultEmbeddingFunction()
+  │    │    ├─ new ChromaClient({ host, port })
+  │    │    └─ client.getOrCreateCollection("pi_memory_{agentName}")
+  │    │
+  │    └─ setInterval(prune, 30_000)          → background stale cleanup
   │
   ├─ Agent runs
   │    ├─ LLM can call mesh tools (list_peers, send, broadcast, discover, prune)
-  │    ├─ LLM can call memory tools (store, recall, search)
+  │    ├─ LLM can call memory tools (store, recall, search, keys)
   │    ├─ Auto-save: each peer conversation turn is persisted to ChromaDB
   │    ├─ Auto-retrieve: incoming peer requests get context prepended from memory
   │    └─ Peers can message each other
   │
   └─ session_shutdown event
        ├─ clear pruning interval
-       ├─ protocols.stop()               → unhandle protocol, unsubscribe topic
+       ├─ protocols.stop()               → unhandle protocol, unsubscribe topics
        ├─ node.stop()                    → close connections, stop discovery
+       ├─ chromaLifecycle.stop()         → SIGTERM ChromaDB child (if we started it)
        └─ agentMemory.stop()             → (no-op, ChromaDB client is stateless)
 ```
+
+### ChromaDB Host Election
+
+The first node to start becomes the ChromaDB host — all other agents connect to it. Discovery is via GossipSub:
+
+```
+Node A (first):   mesh start → subscribe "pi-memory-host" → 2.5s = no host found
+                  → start ChromaDB → announce 192.168.1.50:8000 → connect ✓
+
+Node B (later):   mesh start → subscribe "pi-memory-host" → receive announcement
+                  → connect to 192.168.1.50:8000 ✓ (no local ChromaDB needed)
+```
+
+**Race condition:** If two nodes start simultaneously, both start ChromaDB and both announce. Later nodes connect to whichever announcement arrives first. The "extra" ChromaDB sits idle — harmless but wasteful.
+
+**ChromaDB binding:** ChromaDB is started with `--host 0.0.0.0` so it's reachable from other machines on the network, not just localhost.
+
+**Re-announcement:** A node that finds ChromaDB already running locally (e.g. from a previous session) re-announces itself as the host so newly joined peers can discover it.
+
+**Manual override:** Set `--mesh-chroma-host` or `CHROMA_HOST` to point at a known ChromaDB host, skipping discovery entirely.
 
 ---
 
@@ -981,6 +1039,8 @@ These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPOR
 | `--mesh-swarm-key` | string | — | Path to a `swarm.key` file for private P2P network (PSK). All peers must share the same key. |
 | `--mesh-chroma-host` | string | `localhost` | ChromaDB server hostname (or `CHROMA_HOST` env var) |
 | `--mesh-chroma-port` | number | `8000` | ChromaDB server port (or `CHROMA_PORT` env var) |
+| `--mesh-chroma-token` | string | — | Auth token for ChromaDB (`x-chroma-token` header) |
+| `--mesh-chroma-data-path` | string | `~/.local/share/chroma` | ChromaDB data directory for persistence (or `CHROMA_DATA_PATH` env var) |
 | `--mesh-memory-preset` | string | `large` | Memory limit preset: `small` (32K), `medium` (128K), `large` (1M). Sets all read-side limits at once. |
 | `--mesh-memory-max-entries` | number | — | Override hard max entries (50 for large preset) |
 | `--mesh-memory-truncate` | number | — | Override value truncation in chars (10,000 for large preset) |
@@ -994,6 +1054,8 @@ These fixes were identified in the [OPTIMIZATION-REPORT.md](./OPTIMIZATION-REPOR
 - `PI_SWARM_KEY` — path to a `swarm.key` file (alternative to `--mesh-swarm-key` flag)
 - `CHROMA_HOST` — ChromaDB host (alternative to `--mesh-chroma-host`)
 - `CHROMA_PORT` — ChromaDB port (alternative to `--mesh-chroma-port`)
+- `CHROMA_TOKEN` — ChromaDB auth token (alternative to `--mesh-chroma-token`)
+- `CHROMA_DATA_PATH` — ChromaDB data directory (alternative to `--mesh-chroma-data-path`)
 - `PI_MEMORY_PRESET` — memory limit preset: `small`, `medium`, `large` (alternative to `--mesh-memory-preset`)
 - `PI_MEMORY_MAX_ENTRIES` — override max entries (alternative to `--mesh-memory-max-entries`)
 - `PI_MEMORY_TRUNCATE` — override truncation chars (alternative to `--mesh-memory-truncate`)
