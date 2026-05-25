@@ -89,8 +89,9 @@ export class AgentMemory {
       throw new Error(`ChromaDB unreachable at ${host}:${port}: ${err.message}`);
     }
 
-    // Get or create the agent's collection with retries for transient failures
-    const collectionName = `pi_memory_${agentName}`;
+    // Get or create the shared mesh memory collection.
+    // All agents share one collection so knowledge is accessible across the mesh.
+    const collectionName = "pi_memory_mesh";
     let lastErr: Error | undefined;
 
     for (let attempt = 1; attempt <= AgentMemory.CONNECT_RETRIES; attempt++) {
