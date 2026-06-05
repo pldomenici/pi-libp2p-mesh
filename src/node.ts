@@ -64,7 +64,6 @@ export class MeshNode {
   isRunning = false;
 
   private eventHandlers: MeshNodeEventHandler[] = [];
-  declare private config: MeshConfig;
 
   // ── H2: Internal peer store ──────────────────────────────────────────
   // Persists peers across connect/disconnect cycles so disconnected peers
@@ -79,10 +78,9 @@ export class MeshNode {
   private dialDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DIAL_DEBOUNCE_MS = 200;
 
-  private constructor(libp2p: Libp2p, config: MeshConfig, extensionVersion?: string) {
+  private constructor(libp2p: Libp2p, _config: MeshConfig, extensionVersion?: string) {
     this.libp2p = libp2p;
     this.peerId = libp2p.peerId.toString();
-    this.config = config;
     this.extensionVersion = extensionVersion ?? "unknown";
     this.peerStore = new Map();
     this.pendingDials = new Set();
@@ -333,6 +331,10 @@ export class MeshNode {
    */
   private _onPeerDiscovery = (evt: CustomEvent): void => {
     const detail = evt.detail;
+    if (!detail?.id) {
+      console.debug('[MeshNode] peer:discovery with missing detail.id — skipping');
+      return;
+    }
     const peerId: PeerId = detail.id;
     const peerIdStr = peerId.toString();
 
@@ -404,13 +406,22 @@ export class MeshNode {
   private _onPeerConnect = (evt: CustomEvent): void => {
     const peerIdStr = evt.detail.toString();
 
+    // Guard against malformed PeerId strings
+    let peerIdObj: PeerId;
+    try {
+      peerIdObj = peerIdFromString(peerIdStr);
+    } catch (err: any) {
+      console.debug(`[MeshNode] skipped invalid peer ID in connect ${peerIdStr.slice(0, 12)}…: ${err.message}`);
+      return;
+    }
+
     const stored = this.peerStore.get(peerIdStr);
     if (stored) {
       stored.status = "connected";
       // Clear the disconnected timestamp if this is a reconnection
       stored.disconnectedAt = undefined;
       // Merge addresses from the new connection (may have additional addresses)
-      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const connections = this.libp2p.getConnections(peerIdObj);
       const remoteAddrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       const addrSet = new Set(stored.addresses);
       for (const a of remoteAddrs) addrSet.add(a);
@@ -418,7 +429,7 @@ export class MeshNode {
     } else {
       // Inbound connection before mDNS discovery — create placeholder
       // with addresses backfilled from the actual connection
-      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const connections = this.libp2p.getConnections(peerIdObj);
       const addrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       this.peerStore.set(peerIdStr, {
         id: peerIdStr,
@@ -450,6 +461,15 @@ export class MeshNode {
     // Skip self-identify events
     if (peerIdStr === this.peerId) return;
 
+    // Guard against malformed PeerId strings
+    let peerIdObj: PeerId;
+    try {
+      peerIdObj = peerIdFromString(peerIdStr);
+    } catch (err: any) {
+      console.debug(`[MeshNode] skipped invalid peer ID in identify ${peerIdStr.slice(0, 12)}…: ${err.message}`);
+      return;
+    }
+
     // Extract agent name from the agentVersion string.
     // Format: pi-libp2p-mesh/<extVersion>/<agentName>
     // Legacy: pi-libp2p-mesh/<agentName> or just <agentName>
@@ -480,7 +500,7 @@ export class MeshNode {
     if (stored) {
       stored.agentName = agentName;
       // Merge addresses from the new identify session (may have additional addresses)
-      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const connections = this.libp2p.getConnections(peerIdObj);
       const remoteAddrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       const addrSet = new Set(stored.addresses);
       for (const a of remoteAddrs) addrSet.add(a);
@@ -488,7 +508,7 @@ export class MeshNode {
     } else {
       // Identify before discovery/connect — create placeholder
       // with addresses backfilled from the actual connection
-      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      const connections = this.libp2p.getConnections(peerIdObj);
       const addrs = connections.flatMap((c) => [c.remoteAddr.toString()]).filter(Boolean);
       this.peerStore.set(peerIdStr, {
         id: peerIdStr,

@@ -52,6 +52,21 @@ const store: MeshStore = {
   autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
 };
 
+/** A pending LLM request awaiting agent_end resolution. */
+interface PendingResolver {
+  resolve: (text: string) => void;
+  timer: ReturnType<typeof setTimeout>;
+  timedOut: boolean;
+}
+
+/**
+ * FIFO queue of resolvers for agent_end events.
+ * Each `sendUserMessage` call pushes a resolver; each `agent_end` pops one.
+ * This provides reliable 1:1 pairing regardless of interleaving with
+ * user chat or broadcast-forward turns.
+ */
+const pendingResolvers: PendingResolver[] = [];
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function notify(_pi: ExtensionAPI, msg: string, level: "info" | "warning" | "error" = "info") {
@@ -329,86 +344,45 @@ export default async function (pi: ExtensionAPI) {
       };
 
       // ── LLM Request Queue (FIFO) ────────────────────────────────────────
-      // Fixes H4: concurrent onRequest calls no longer race on turn_end.
-      // Uses a single global turn_end listener + activeRequest flag instead
-      // of per-request register/off (pi.off doesn't exist in the ExtensionAPI).
+      // Uses a module-level FIFO resolver queue paired with the `agent_end`
+      // event for reliable 1:1 request-response mapping.
 
       const REQUEST_TIMEOUT_MS = 60_000;
       const MAX_QUEUE_SIZE = 50;
 
-      type PendingRequest = {
-        peerId: string;
-        request: import("./types.js").AgentRequest;
-        resolve: (text: string) => void;
-        timer: ReturnType<typeof setTimeout>;
-        /** Set to true when the timeout fires before the entry reaches the LLM. */
-        timedOut: boolean;
-        /** Auto-retrieved memory context injected into the user message. */
-        memoryContext?: string;
-      };
-
-      const requestQueue: PendingRequest[] = [];
-      let activeRequest: PendingRequest | null = null;
-
-      /** Extract assistant text from a turn_end event. */
-      function extractResponseText(msg: any): string {
-        if (!msg || msg.role !== "assistant") return "[no assistant response]";
-        if (typeof msg.content === "string") return msg.content || "[empty response]";
-        if (Array.isArray(msg.content)) {
-          return msg.content
-            .filter((c: any) => c.type === "text")
-            .map((c: any) => c.text)
-            .join("\n") || "[empty response]";
+      /** Extract assistant text from an agent_end event's messages array. */
+      function extractResponseFromMessages(messages: any[]): string {
+        if (!messages || !Array.isArray(messages)) return "[no response]";
+        // Walk backward to find the last assistant message
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg?.role === "assistant") {
+            if (typeof msg.content === "string") return msg.content || "[empty response]";
+            if (Array.isArray(msg.content)) {
+              const text = msg.content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("\n");
+              return text || "[empty response]";
+            }
+            return "[non-text response]";
+          }
         }
-        return "[non-text response]";
+        return "[no assistant response]";
       }
 
-      /** Dequeue and send the next pending request to the LLM. */
-      function advanceQueue() {
-        // Already waiting for the current request — the turn_end listener
-        // will call this again after it resolves.
-        if (activeRequest) return;
+      // Use agent_end instead of turn_end for perfect request-response pairing.
+      // Each sendUserMessage() call triggers exactly one agent cycle, and each
+      // agent cycle produces exactly one agent_end event.
+      pi.on("agent_end", (_event) => {
+        const pending = pendingResolvers.shift();
+        if (!pending) return; // No mesh request waiting — must be user chat
 
-        // Discard entries whose timeouts already fired (they resolved via timeout)
-        while (requestQueue.length > 0 && requestQueue[0].timedOut) {
-          requestQueue.shift();
-        }
+        clearTimeout(pending.timer);
+        if (pending.timedOut) return; // Already resolved by timeout
 
-        if (requestQueue.length === 0) return;
-
-        activeRequest = requestQueue.shift()!;
-
-        // Build the user message with optional memory context
-        let userMessage = `[Mesh message from ${activeRequest.request.fromAgent}]\n\n${activeRequest.request.message}`;
-        if (activeRequest.memoryContext) {
-          userMessage = activeRequest.memoryContext + "\n\n" + userMessage;
-        }
-
-        pi.sendUserMessage(userMessage, { deliverAs: "steer" });
-      }
-
-      // ONE global turn_end listener — registered once, never removed
-      pi.on("turn_end", (event) => {
-        if (!activeRequest) return;
-        const req = activeRequest;
-        activeRequest = null;
-        clearTimeout(req.timer);
-        const responseText = extractResponseText(event.message);
-        req.resolve(responseText);
-
-        // Auto-save exchange to memory (fire-and-forget, non-blocking)
-        if (agentMemory) {
-          agentMemory.store({
-            peerId: req.peerId,
-            key: "exchange",
-            value: `[Request from ${req.request.fromAgent}] ${req.request.message}\n[Response] ${responseText}`,
-            metadata: { type: "conversation_turn", requestId: req.request.requestId },
-          }).catch((err) => {
-            console.warn("[pi-libp2p-mesh] exchange auto-save failed:", (err as Error).message);
-          });
-        }
-
-        advanceQueue();
+        const responseText = extractResponseFromMessages((_event as any).messages);
+        pending.resolve(responseText);
       });
 
       // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
@@ -419,7 +393,7 @@ export default async function (pi: ExtensionAPI) {
         }
 
         // Backpressure: reject the request immediately if queue is full
-        if (requestQueue.length >= MAX_QUEUE_SIZE) {
+        if (pendingResolvers.length >= MAX_QUEUE_SIZE) {
           return `[queue-full] Agent request queue is full (max ${MAX_QUEUE_SIZE}). Please retry later.`;
         }
 
@@ -433,26 +407,40 @@ export default async function (pi: ExtensionAPI) {
           }
         }
 
-        return new Promise<string>((resolve) => {
-          const entry: PendingRequest = {
-            peerId,
-            request,
-            resolve,
-            timer: undefined as any,
-            timedOut: false,
-            memoryContext,
-          };
+        // Build the user message with optional memory context
+        let userMessage = `[Mesh message from ${request.fromAgent}]\n\n${request.message}`;
+        if (memoryContext) {
+          userMessage = memoryContext + "\n\n" + userMessage;
+        }
 
-          entry.timer = setTimeout(() => {
-            // Mark as timed out so advanceQueue() will skip it
-            entry.timedOut = true;
+        return new Promise<string>((resolve) => {
+          let timedOut = false;
+          const timer = setTimeout(() => {
+            timedOut = true;
             resolve(
               `[timeout] Agent did not respond within ${REQUEST_TIMEOUT_MS / 1000}s to: "${request.message}"`,
             );
           }, REQUEST_TIMEOUT_MS);
 
-          requestQueue.push(entry);
-          advanceQueue();
+          // Push resolver BEFORE calling sendUserMessage so the agent_end
+          // handler always finds it in the queue.
+          pendingResolvers.push({ resolve, timer, timedOut });
+
+          // Fire off the LLM request — agent_end will resolve our promise
+          pi.sendUserMessage(userMessage, { deliverAs: "steer" });
+        }).then((responseText) => {
+          // Auto-save exchange to memory (fire-and-forget, non-blocking)
+          if (agentMemory) {
+            agentMemory.store({
+              peerId,
+              key: "exchange",
+              value: `[Request from ${request.fromAgent}] ${request.message}\n[Response] ${responseText}`,
+              metadata: { type: "conversation_turn", requestId: request.requestId },
+            }).catch((err) => {
+              console.warn("[pi-libp2p-mesh] exchange auto-save failed:", (err as Error).message);
+            });
+          }
+          return responseText;
         });
       };
 
@@ -695,6 +683,15 @@ export default async function (pi: ExtensionAPI) {
 
   // 2. Session lifecycle: stop node
   pi.on("session_shutdown", async () => {
+    // Drain and stale any pending request queue entries
+    for (const pending of pendingResolvers) {
+      clearTimeout(pending.timer);
+      if (!pending.timedOut) {
+        pending.resolve("[shutdown] Session ended while request was queued");
+      }
+    }
+    pendingResolvers.length = 0;
+
     // Stop background pruning
     if (pruneInterval) {
       clearInterval(pruneInterval);

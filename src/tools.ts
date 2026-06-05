@@ -272,18 +272,51 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
       try {
         const MAX_ATTEMPTS = 2;
         const RETRY_DELAY_MS = 500;
-        let response: import("./types.js").AgentResponse;
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           try {
-            response = await meshProtocols.sendMessage(params.peerId, {
+            const response = await meshProtocols.sendMessage(params.peerId, {
               protocol: "/pi-agent/0.1.0",
               requestId: uuidv4(),
               fromAgent: store.agentName,
               message: params.message,
               autoReply: params.autoReply,
             });
-            break; // success — exit retry loop
+
+            // Success — handle response inline, no post-loop assertion needed
+
+            // Auto-save outgoing exchange to memory (fire-and-forget, non-blocking)
+            if (agentMemory) {
+              agentMemory.store({
+                peerId: params.peerId,
+                key: "exchange",
+                value: `[Sent] ${params.message}\n[Response from ${response.fromAgent}] ${response.message}`,
+                metadata: { type: "conversation_turn" },
+              }).catch((err) => {
+                console.warn("[pi-libp2p-mesh] outgoing exchange auto-save failed:", (err as Error).message);
+              });
+            }
+
+            onUpdate?.({
+              content: [{ type: "text", text: `Response from ${response.fromAgent}:` }],
+              details: {},
+            });
+
+            const result: MeshSendResult = {
+              peerId: params.peerId,
+              agentName: response.fromAgent,
+              response,
+            };
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `**Response from ${response.fromAgent}** (${params.peerId}):\n\n${response.message}` +
+                    (response.error ? "\n\n⚠️ Peer reported an error." : ""),
+                },
+              ],
+              details: result,
+            };
           } catch (dialErr: any) {
             if (attempt === MAX_ATTEMPTS) throw dialErr; // last attempt — rethrow
             // Transient failure — wait and retry
@@ -296,42 +329,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
           }
         }
-
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        const finalResponse = response!;
-
-        // Auto-save outgoing exchange to memory (fire-and-forget — don't block the LLM)
-        if (agentMemory) {
-          agentMemory.store({
-            peerId: params.peerId,
-            key: "exchange",
-            value: `[Sent] ${params.message}\n[Response from ${finalResponse.fromAgent}] ${finalResponse.message}`,
-            metadata: { type: "conversation_turn" },
-          }).catch((err) => {
-            console.warn("[pi-libp2p-mesh] outgoing exchange auto-save failed:", (err as Error).message);
-          });
-        }
-
-        onUpdate?.({
-          content: [{ type: "text", text: `Response from ${finalResponse.fromAgent}:` }],
-          details: {},
-        });
-
-        const result: MeshSendResult = {
-          peerId: params.peerId,
-          agentName: finalResponse.fromAgent,
-          response: finalResponse,
-        };
-        return {
-          content: [
-            {
-              type: "text",
-              text: `**Response from ${finalResponse.fromAgent}** (${params.peerId}):\n\n${finalResponse.message}` +
-                (finalResponse.error ? "\n\n⚠️ Peer reported an error." : ""),
-            },
-          ],
-          details: result,
-        };
+        // Should never reach here — loop returns or throws
+        throw new Error("All retry attempts exhausted without response");
       } catch (err: any) {
         const result: MeshSendResult = {
           peerId: params.peerId,

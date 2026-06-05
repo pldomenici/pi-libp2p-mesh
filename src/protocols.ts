@@ -27,7 +27,6 @@ import type {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
-/**
  * Read the entirety of a libp2p {@link Stream} into a single `Uint8Array`,
  * respecting an optional {@link AbortSignal} to prevent indefinite hangs.
  *
@@ -156,12 +155,8 @@ export class MeshProtocols {
     const pubsub = this.resolvePubsub();
     if (pubsub != null) {
       pubsub.subscribe(topic);
-      // NOTE: GossipSub emits 'gossipsub:message', not 'message'.
-      // The detail is GossipsubMessage { msg, propagationSource, msgId },
-      // not a bare libp2p Message.
-      // Cast needed: GossipSub emits 'gossipsub:message' which is not in the
-      // base PubSubEvents type — only GossipSub (not generic PubSub) has this.
-      (pubsub as any).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
+        // GossipSub-specific event (not in base PubSubEvents type)
+      ;(pubsub as { addEventListener: (evt: string, cb: (event: CustomEvent<GossipsubMessage>) => void) => void }).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
         this.handleGossipMessage(event).catch((err: unknown) =>
           console.error('[mesh-protocols] gossip handler error:', err),
         );
@@ -338,15 +333,17 @@ export class MeshProtocols {
       return;
     }
     pubsub.subscribe(topic);
-    (pubsub as any).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
+    ;(pubsub as { addEventListener: (evt: string, cb: (event: CustomEvent<GossipsubMessage>) => void) => void }).addEventListener('gossipsub:message', (event: CustomEvent<GossipsubMessage>) => {
       const gMsg = event.detail;
       // We only handle messages for our specific topic
-      if ((gMsg.msg as any).topic !== topic) return;
+      if (gMsg.msg.topic !== topic) return;
       try {
         const decoded = decode(gMsg.msg.data) as T;
         // Skip our own messages (GossipSub delivers to publisher too)
         if ((decoded as any).fromPeerId === this.libp2p.peerId.toString()) return;
-        onMessage(decoded, (gMsg.msg as any).from?.toString?.() ?? "");
+        // from may be absent on unsigned messages — cast is safe for gossipsub
+        const fromPeerId = (gMsg.msg as { from?: { toString(): string } }).from?.toString?.() ?? "";
+        onMessage(decoded, fromPeerId);
       } catch (err) {
         console.warn(`[mesh-protocols] Failed to decode message on "${topic}":`, err);
       }
@@ -398,13 +395,23 @@ export class MeshProtocols {
    * Reads the `AgentRequest` from the stream, writes an automatic echo
    * `AgentResponse`, and notifies the `onMessage` callback.
    */
+  private static readonly INCOMING_STREAM_TIMEOUT_MS = 60_000;
+
   private async handleIncomingMessage(
     stream: Stream,
     peerIdStr: string,
   ): Promise<void> {
     try {
-      // Read the full request
-      const raw = await readStream(stream);
+      // Read the full request with a timeout to prevent indefinite hang
+      // from a misbehaving peer that opens a stream but never half-closes.
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), MeshProtocols.INCOMING_STREAM_TIMEOUT_MS);
+      let raw: Uint8Array;
+      try {
+        raw = await readStream(stream, abortController.signal);
+      } finally {
+        clearTimeout(timeoutId);
+      }
       const request: AgentRequest = decode(raw) as AgentRequest;
 
       let responseMessage: string;
@@ -433,7 +440,10 @@ export class MeshProtocols {
       stream.send(encode(response));
 
       // Notify the registered callback (for logging/side effects)
-      this._onMessage?.(peerIdStr, request);
+      // Wrap in Promise.resolve to catch any async rejections
+      Promise.resolve(this._onMessage?.(peerIdStr, request)).catch((err) => {
+        console.error('[mesh-protocols] onMessage handler error:', err);
+      });
     } catch (err) {
       // M2: Write an error response so the sender fails fast (<100ms)
       // instead of waiting for its full 30s timeout.
@@ -477,13 +487,15 @@ export class MeshProtocols {
     // Only handle the main broadcast topic — other topics (e.g. memory host
     // announcements) are handled by their own subscribeRawTopic listeners.
     const topic = this.config.gossipTopic ?? 'pi-broadcast';
-    if ((message as any).topic !== topic) return;
+    if (message.topic !== topic) return;
 
     const broadcastMsg: BroadcastMessage = decode(message.data) as BroadcastMessage;
-    this._onBroadcast?.(broadcastMsg);
+    // Wrap in Promise.resolve to catch any async rejections
+    Promise.resolve(this._onBroadcast?.(broadcastMsg)).catch((err) => {
+      console.error('[mesh-protocols] onBroadcast handler error:', err);
+    });
   }
 
-  /**
   /**
    * Resolve the GossipSub pubsub instance from wherever it is mounted
    * on the libp2p node.
