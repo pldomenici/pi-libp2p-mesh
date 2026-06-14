@@ -1,6 +1,6 @@
 {
   "name": "pi-libp2p-mesh",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "P2P mesh network extension for pi agents built on libp2p — peer discovery, direct messaging, and gossip broadcast.",
   "keywords": [
     "pi-package",
