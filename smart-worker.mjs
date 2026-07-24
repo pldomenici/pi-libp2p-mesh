@@ -201,7 +201,15 @@ function setupProtocolHandler(node, name, peerId) {
         message: answer,
         error: false,
       };
-      await stream.send(cborg.encode(response));
+      if (!stream.send(cborg.encode(response))) {
+        await new Promise((resolve, reject) => {
+          const onDrain = () => { cleanup(); resolve(); };
+          const onClose = (evt) => { cleanup(); reject(new Error(evt?.detail?.error?.message || 'closed')); };
+          const cleanup = () => { stream.removeEventListener('drain', onDrain); stream.removeEventListener('close', onClose); };
+          stream.addEventListener('drain', onDrain, { once: true });
+          stream.addEventListener('close', onClose, { once: true });
+        });
+      }
       await stream.close();
     } catch (err) {
       console.error(`[${name}] handler error:`, err.message);

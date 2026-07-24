@@ -381,7 +381,12 @@ export class MeshNode {
     this.pendingDials.clear();
 
     for (const peerIdStr of peers) {
-      // Check that the peer isn't already connected (fast-path skip)
+      // Check for existing connections (real TCP state) to prevent
+      // duplicate connections when both peers auto-dial simultaneously.
+      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+      if (connections.length > 0) continue;
+
+      // Also check stored status as fast-path fallback
       const stored = this.peerStore.get(peerIdStr);
       if (stored?.status === "connected") continue;
 

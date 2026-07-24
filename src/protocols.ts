@@ -242,54 +242,88 @@ export class MeshProtocols {
 
     // Create an AbortController for the timeout (default 60s; per-request override)
     const timeoutMs = request.timeoutMs ?? 15_000;
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
 
-    let stream: Stream | null = null;
+    // Retry loop: handle streams that arrive closed due to connection races
+    const MAX_RETRIES = 2;
+    let lastError: Error | undefined;
 
-    // Build an abort promise that rejects when the timeout fires.
-    // We race it against dialProtocol because libp2p's dial may not
-    // always respect the AbortSignal at the transport level (TCP
-    // connect can hang indefinitely for unreachable peers).
-    const abortPromise = new Promise<never>((_, reject) => {
-      if (abortController.signal.aborted) {
-        reject(new DOMException("Dial aborted (timeout)", "AbortError"));
-        return;
-      }
-      abortController.signal.addEventListener("abort", () => {
-        reject(new DOMException("Dial aborted (timeout)", "AbortError"));
-      }, { once: true });
-    });
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
 
-    try {
-      // Dial the peer and open a protocol stream
-      stream = await Promise.race([
-        this.libp2p.dialProtocol(peerIdObj, [this.protocol], {
-          signal: abortController.signal,
-        }),
-        abortPromise,
-      ]);
+      let stream: Stream | null = null;
 
-      // Write the request to the stream (v3: send + half-close write side to signal end-of-request)
-      stream.send(encode(fullRequest));
-      await stream.close({ signal: abortController.signal });
+      const abortPromise = new Promise<never>((_, reject) => {
+        if (abortController.signal.aborted) {
+          reject(new DOMException("Dial aborted (timeout)", "AbortError"));
+          return;
+        }
+        abortController.signal.addEventListener("abort", () => {
+          reject(new DOMException("Dial aborted (timeout)", "AbortError"));
+        }, { once: true });
+      });
 
-      // Read the full response (abort-aware — prevents indefinite hang if the
-      // remote peer closes write but never sends data)
-      const raw = await readStream(stream, abortController.signal);
-      return decode(raw) as AgentResponse;
-    } finally {
-      clearTimeout(timeoutId);
-      // Best-effort full cleanup in case of error during read.
-      // If the stream is already half-closed, this is a safe no-op.
-      if (stream != null) {
-        try {
-          await stream.close();
-        } catch {
-          // best-effort cleanup
+      try {
+        // Dial the peer and open a protocol stream
+        stream = await Promise.race([
+          this.libp2p.dialProtocol(peerIdObj, [this.protocol], {
+            signal: abortController.signal,
+          }),
+          abortPromise,
+        ]);
+
+        // Guard: stream may arrive already closed due to yamux connection races
+        if (stream.writeStatus !== 'writable') {
+          throw new DOMException(
+            `Stream not writable (status: ${stream.writeStatus})`,
+            "StreamClosed"
+          );
+        }
+
+        // Write the request with backpressure handling
+        const encoded = encode(fullRequest);
+        if (!stream.send(encoded)) {
+          // Write buffer full — wait for drain before closing
+          await new Promise<void>((resolve, reject) => {
+            const onDrain = () => { cleanup(); resolve(); };
+            const onClose = (evt: any) => {
+              cleanup();
+              reject(new Error(evt?.detail?.error?.message || 'Stream closed while waiting for drain'));
+            };
+            const cleanup = () => {
+              stream!.removeEventListener('drain', onDrain);
+              stream!.removeEventListener('close', onClose);
+            };
+            stream!.addEventListener('drain', onDrain, { once: true });
+            stream!.addEventListener('close', onClose, { once: true });
+          });
+        }
+        await stream.close({ signal: abortController.signal });
+
+        // Read the full response
+        const raw = await readStream(stream, abortController.signal);
+        return decode(raw) as AgentResponse;
+      } catch (err: any) {
+        lastError = err;
+        // Only retry on transient stream errors (race conditions, resets)
+        if (err.name === 'StreamClosed' || err.message?.includes('not writable') || err.message?.includes('reset')) {
+          if (attempt < MAX_RETRIES) {
+            console.debug(
+              `[mesh-protocols] retrying sendMessage to ${peerId.slice(0, 12)}… (attempt ${attempt + 1}/${MAX_RETRIES + 1})`,
+            );
+            continue;
+          }
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+        if (stream != null) {
+          try { await stream.close(); } catch { /* best-effort */ }
         }
       }
     }
+
+    throw lastError ?? new Error('sendMessage failed after retries');
   }
 
   /**
