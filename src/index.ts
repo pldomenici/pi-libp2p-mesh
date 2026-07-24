@@ -807,6 +807,16 @@ export default async function (pi: ExtensionAPI) {
         }
       };
 
+      // ── Mesh-aware system prompt guidance ────────────────────────────
+      // Inject best practices for delegating work across the P2P mesh.
+      pi.on("before_agent_start", (event: any) => {
+        event.systemPrompt += `\n\n## P2P Mesh Guidelines\n` +
+          `- When delegating work to other agents via mesh_send, decompose large tasks into small subtasks that each complete within the heartbeat timeout (~30s).\n` +
+          `- A single mesh_send that asks an agent to \"analyze this entire file for 5 categories of bugs\" will likely time out. Instead send 3-4 focused queries.\n` +
+          `- The heartbeat/late-delivery system is a safety net — not the primary strategy. Small, focused subtasks are always better.\n` +
+          `- Use autoReply for simple pings/checks. Use full LLM queries only when you need reasoning.\n`;
+      });
+
       /**
        * Build memory context for an incoming request from a peer.
        * Combines semantic search + most recent exchange, capped by config budget.
