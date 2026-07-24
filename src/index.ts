@@ -49,6 +49,14 @@ let memoryHostAnnounceInterval: ReturnType<typeof setInterval> | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 let rttCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
+/** Guard flag: set true during session_start, false during session_shutdown.
+ * Prevents duplicate event handlers from processing events after reload. */
+let sessionActive = false;
+
+/** Counter: incremented before sendUserMessage, decremented in agent_end.
+ * Prevents user chat agent_end events from stealing mesh request resolvers. */
+let pendingMeshTurns = 0;
+
 const store: MeshStore = {
   peers: new Map(),
   broadcastHistory: [],
@@ -463,6 +471,10 @@ export default async function (pi: ExtensionAPI) {
 
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
+    sessionActive = true;
+    // Drain any stale resolvers from a previous session crash
+    pendingResolvers.length = 0;
+    pendingMeshTurns = 0;
     // Resolve agent name now (CLI flags are parsed at this point):
     //   1. --agent-name CLI flag (explicit)
     //   2. PI_MESH_NAME or PI_COMM_NAME env var (backward compat with pi-comm)
@@ -557,6 +569,13 @@ export default async function (pi: ExtensionAPI) {
       // Each sendUserMessage() call triggers exactly one agent cycle, and each
       // agent cycle produces exactly one agent_end event.
       pi.on("agent_end", (_event) => {
+        if (!sessionActive) return; // Guard against duplicate handlers after session reload
+        // Only consume a resolver if this agent_end was triggered by a mesh
+        // request (steer-delivered message). User chat agent_end events must
+        // not steal resolvers from the queue.
+        if (pendingMeshTurns <= 0) return;
+        pendingMeshTurns--;
+
         const pending = pendingResolvers.shift();
         if (!pending) return; // No mesh request waiting — must be user chat
 
@@ -698,6 +717,7 @@ export default async function (pi: ExtensionAPI) {
           pending.timer = setTimeout(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 
           // Fire off the LLM request — agent_end will resolve our promise
+          pendingMeshTurns++;
           pi.sendUserMessage(userMessage, { deliverAs: "steer" });
         }).then((responseText) => {
           mcStats.messagesSent++;
@@ -810,6 +830,7 @@ export default async function (pi: ExtensionAPI) {
       // ── Mesh-aware system prompt guidance ────────────────────────────
       // Inject best practices for delegating work across the P2P mesh.
       pi.on("before_agent_start", (event: any) => {
+        if (!sessionActive) return; // Guard against duplicate handlers after session reload
         event.systemPrompt += `\n\n## P2P Mesh Guidelines\n` +
           `- When delegating work to other agents via mesh_send, decompose large tasks into small subtasks that each complete within the heartbeat timeout (~30s).\n` +
           `- A single mesh_send that asks an agent to \"analyze this entire file for 5 categories of bugs\" will likely time out. Instead send 3-4 focused queries.\n` +
@@ -1085,6 +1106,8 @@ export default async function (pi: ExtensionAPI) {
 
   // 2. Session lifecycle: stop node
   pi.on("session_shutdown", async () => {
+    sessionActive = false;
+    pendingMeshTurns = 0;
     // Drain and stale any pending request queue entries
     for (const pending of pendingResolvers) {
       clearTimeout(pending.timer);
