@@ -208,7 +208,7 @@ export function listPeers(store: MeshStore): PeerListResult {
 /**
  * Register all four mesh tools on the pi extension API.
  */
-export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
+export function registerMeshTools(pi: ExtensionAPI, store: MeshStore, stats?: { recordSent: (to: string) => void; recordBroadcast: () => void }): void {
   // ── mesh_list_peers ─────────────────────────────────────────────────────
   pi.registerTool({
     name: "mesh_list_peers",
@@ -325,6 +325,9 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             // Record outgoing RTT timestamp so we can compute RTT when the
             // async response arrives (via responseToRequestId in onRequest).
             recordOutgoingRtt(requestId);
+
+            // Update mission-control stats
+            stats?.recordSent(params.peerId);
 
             // Success — handle response inline, no post-loop assertion needed
 
@@ -447,6 +450,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
           message: params.message,
           type: msgType,
         });
+
+        stats?.recordBroadcast();
 
         return {
           content: [

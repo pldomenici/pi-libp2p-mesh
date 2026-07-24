@@ -83,6 +83,28 @@ const mcStats = {
   pendingRtt: new Map<string, number>(),
 };
 
+/** Exported stats hooks so tools.ts can update mission-control counters. */
+export const mcStatsApi = {
+  recordSent(toPeerId: string) {
+    mcStats.messagesSent++;
+    const pm = mcStats.peerMessages.get(toPeerId) ?? { sent: 0, received: 0 };
+    pm.sent++;
+    mcStats.peerMessages.set(toPeerId, pm);
+    mcStats.recentMsgTimestamps.push(Date.now());
+    const linkKey = `${store.peerId}→${toPeerId}`;
+    const existing = mcStats.commLinks.get(linkKey) ?? { count: 0, lastTimestamp: 0, totalRtt: 0, rttSamples: 0 };
+    existing.count++; existing.lastTimestamp = Date.now();
+    mcStats.commLinks.set(linkKey, existing);
+  },
+  recordBroadcast() {
+    mcStats.broadcastsSent++;
+    mcStats.recentMsgTimestamps.push(Date.now());
+  },
+  recordError() {
+    mcStats.errors++;
+  },
+};
+
 /** A pending LLM request awaiting agent_end resolution. */
 interface PendingResolver {
   resolve: (text: string) => void;
@@ -1168,7 +1190,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // 3. Register mesh tools
-  registerMeshTools(pi, store);
+  registerMeshTools(pi, store, mcStatsApi);
 
   // 3b. Register memory tools
   registerMemoryTools(pi, store);
