@@ -101,7 +101,7 @@ async function askGemini(query) {
 async function askDeepSeek(query) {
   const url = "https://api.deepseek.com/v1/chat/completions";
   const body = {
-    model: "deepseek-chat",
+    model: "deepseek-v4-pro",
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: query },
@@ -150,7 +150,11 @@ async function createNode() {
     transports: [tcp(), webSockets()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    nodeInfo: { userAgent: `pi-${AGENT_NAME}` },
+    nodeInfo: {
+      userAgent: `pi-libp2p-mesh/1.0.0/${AGENT_NAME}`,
+      name: "pi-libp2p-mesh",
+      version: `1.0.0/${AGENT_NAME}`,
+    },
     services: {
       identify: identify(),
       pubsub: gossipsub(),
@@ -179,9 +183,14 @@ function setupProtocolHandler(node, name, peerId) {
       const request = cborg.decode(raw);
       const query = request.message || "";
 
-      console.log(`[${name}] ← query from ${request.fromAgent || remotePeer.slice(-8)}: "${query.slice(0, 100)}"`);
-
-      const answer = await askLLM(query);
+      let answer;
+      if (request.autoReply === true) {
+        answer = `[auto-response] Received: "${query.slice(0, 200)}"`;
+        console.log(`[${name}] ← auto-reply to ${request.fromAgent || remotePeer.slice(-8)}: "${query.slice(0, 100)}"`);
+      } else {
+        console.log(`[${name}] ← query from ${request.fromAgent || remotePeer.slice(-8)}: "${query.slice(0, 100)}"`);
+        answer = await askLLM(query);
+      }
       console.log(`[${name}] → response (${answer.length} chars)`);
 
       const response = {
@@ -193,6 +202,7 @@ function setupProtocolHandler(node, name, peerId) {
         error: false,
       };
       await stream.send(cborg.encode(response));
+      await stream.close();
     } catch (err) {
       console.error(`[${name}] handler error:`, err.message);
     }

@@ -42,35 +42,47 @@ async function readStream(
     throw new DOMException("readStream aborted before start", "AbortError");
   }
 
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-
-  // Stream is AsyncIterable<Uint8Array | Uint8ArrayList> in v3
-  for await (const raw of stream) {
-    // Check for abort between chunks (prevents indefinite hang on
-    // a stream that trickles data but never closes).
+  // Build a promise that rejects when the signal fires.
+  // We race this against the stream iteration so we don't block
+  // forever when a remote peer opens a stream but never sends data.
+  const abortPromise = new Promise<never>((_, reject) => {
     if (signal?.aborted) {
-      throw new DOMException("readStream aborted mid-read", "AbortError");
+      reject(new DOMException("readStream aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      reject(new DOMException("readStream aborted", "AbortError"));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+  const readPromise = (async (): Promise<Uint8Array> => {
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+
+    // Stream is AsyncIterable<Uint8Array | Uint8ArrayList> in v3
+    for await (const raw of stream) {
+      const chunk =
+        raw instanceof Uint8Array
+          ? raw
+          : (raw as unknown as Uint8ArrayList).subarray();
+      chunks.push(chunk);
+      totalBytes += chunk.byteLength;
     }
 
-    const chunk =
-      raw instanceof Uint8Array
-        ? raw
-        : (raw as unknown as Uint8ArrayList).subarray();
-    chunks.push(chunk);
-    totalBytes += chunk.byteLength;
-  }
+    if (chunks.length === 0) return new Uint8Array(0);
 
-  if (chunks.length === 0) return new Uint8Array(0);
+    // Single-pass concatenation — only one copy of the data
+    const result = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return result;
+  })();
 
-  // Single-pass concatenation — only one copy of the data
-  const result = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
+  return Promise.race([readPromise, abortPromise]);
 }
 
 // ── MeshProtocols ────────────────────────────────────────────────────────────
@@ -229,16 +241,34 @@ export class MeshProtocols {
     };
 
     // Create an AbortController for the timeout (default 60s; per-request override)
-    const timeoutMs = request.timeoutMs ?? 60_000;
+    const timeoutMs = request.timeoutMs ?? 15_000;
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
 
     let stream: Stream | null = null;
+
+    // Build an abort promise that rejects when the timeout fires.
+    // We race it against dialProtocol because libp2p's dial may not
+    // always respect the AbortSignal at the transport level (TCP
+    // connect can hang indefinitely for unreachable peers).
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (abortController.signal.aborted) {
+        reject(new DOMException("Dial aborted (timeout)", "AbortError"));
+        return;
+      }
+      abortController.signal.addEventListener("abort", () => {
+        reject(new DOMException("Dial aborted (timeout)", "AbortError"));
+      }, { once: true });
+    });
+
     try {
       // Dial the peer and open a protocol stream
-      stream = await this.libp2p.dialProtocol(peerIdObj, [this.protocol], {
-        signal: abortController.signal,
-      });
+      stream = await Promise.race([
+        this.libp2p.dialProtocol(peerIdObj, [this.protocol], {
+          signal: abortController.signal,
+        }),
+        abortPromise,
+      ]);
 
       // Write the request to the stream (v3: send + half-close write side to signal end-of-request)
       stream.send(encode(fullRequest));
@@ -395,7 +425,7 @@ export class MeshProtocols {
    * Reads the `AgentRequest` from the stream, writes an automatic echo
    * `AgentResponse`, and notifies the `onMessage` callback.
    */
-  private static readonly INCOMING_STREAM_TIMEOUT_MS = 60_000;
+  private static readonly INCOMING_STREAM_TIMEOUT_MS = 15_000;
 
   private async handleIncomingMessage(
     stream: Stream,
@@ -431,30 +461,48 @@ export class MeshProtocols {
         };
         stream.send(encode(response));
       } else if (this._onRequest) {
-        // ── Async LLM processing ───────────────────────────────────────
-        // Write ACK immediately so the sender doesn't block on our LLM
-        // (which may take 10-60s). The real response arrives later via a
-        // follow-up mesh_send with responseToRequestId set.
-        const ack: AgentResponse = {
-          requestId: request.requestId,
-          fromAgent: this.config.agentName,
-          fromPeerId: this.libp2p.peerId.toString(),
-          timestamp: Date.now(),
-          message: `[queued] Accepted — response will arrive asynchronously`,
-          error: false,
-          queued: true,
-        };
-        stream.send(encode(ack));
-        await stream.close();
+        // ── Backward-compatible LLM processing ────────────────────────
+        // If the sender lacks an extensionVersion, it is running old code
+        // that expects a synchronous response on this stream. Await the
+        // LLM and respond inline so the sender doesn't time out.
+        if (!request.extensionVersion) {
+          // Old sender — sync LLM (backward compat)
+          const responseMessage = await this._onRequest(peerIdStr, request);
+          const response: AgentResponse = {
+            requestId: request.requestId,
+            fromAgent: this.config.agentName,
+            fromPeerId: this.libp2p.peerId.toString(),
+            timestamp: Date.now(),
+            message: responseMessage,
+            error: false,
+          };
+          stream.send(encode(response));
+        } else {
+          // ── Async LLM processing ───────────────────────────────────────
+          // Write ACK immediately so the sender doesn't block on our LLM
+          // (which may take 10-60s). The real response arrives later via a
+          // follow-up mesh_send with responseToRequestId set.
+          const ack: AgentResponse = {
+            requestId: request.requestId,
+            fromAgent: this.config.agentName,
+            fromPeerId: this.libp2p.peerId.toString(),
+            timestamp: Date.now(),
+            message: `[queued] Accepted — response will arrive asynchronously`,
+            error: false,
+            queued: true,
+          };
+          stream.send(encode(ack));
+          await stream.close();
 
-        // Fire-and-forget: process through LLM. The callback is responsible
-        // for sending the response back via mesh_send.
-        this._onRequest(peerIdStr, request).catch((err) =>
-          console.error('[mesh-protocols] async onRequest error:', err),
-        );
+          // Fire-and-forget: process through LLM. The callback is responsible
+          // for sending the response back via mesh_send.
+          this._onRequest(peerIdStr, request).catch((err) =>
+            console.error('[mesh-protocols] async onRequest error:', err),
+          );
 
-        // Skip the normal response+close path below (stream already closed)
-        return;
+          // Skip the normal response+close path below (stream already closed)
+          return;
+        }
       } else {
         // Fallback: no LLM handler registered
         const response: AgentResponse = {

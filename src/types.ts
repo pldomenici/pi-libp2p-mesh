@@ -26,6 +26,8 @@ export interface MeshPeer {
   status: "connected" | "disconnected";
   /** Agent name (discovered via Identify protocol handshake) */
   agentName?: string;
+  /** Extension version of this peer (discovered via Identify protocol). Used for async LLM compat detection. */
+  extensionVersion?: string;
   /** When this peer was first seen (epoch ms) */
   discoveredAt: number;
   /** When this peer last disconnected (epoch ms, 0 if still connected) */

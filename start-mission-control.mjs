@@ -175,7 +175,11 @@ async function createNode() {
     transports: [tcp(), webSockets()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    nodeInfo: { userAgent: `pi-${AGENT_NAME}` },
+    nodeInfo: {
+      userAgent: `pi-libp2p-mesh/1.0.0/${AGENT_NAME}`,
+      name: "pi-libp2p-mesh",
+      version: `1.0.0/${AGENT_NAME}`,
+    },
     services: {
       identify: identify(),
       pubsub: gossipsub(),

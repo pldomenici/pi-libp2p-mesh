@@ -288,6 +288,13 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
         const MAX_ATTEMPTS = 2;
         const RETRY_DELAY_MS = 500;
 
+        // Detect old receivers: if the peer lacks an extensionVersion, it runs
+        // old code that expects a synchronous LLM response on the same stream
+        // (no async ACK). Use a 60s timeout instead of the default 15s.
+        const peer = store.peers.get(params.peerId);
+        const isOldReceiver = peer && !peer.extensionVersion;
+        const effectiveTimeout = isOldReceiver ? 60_000 : undefined; // undefined → default 15s
+
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           try {
             const requestId = uuidv4();
@@ -297,6 +304,7 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
               fromAgent: store.agentName,
               message: params.message,
               autoReply: params.autoReply,
+              timeoutMs: effectiveTimeout,
             });
 
             // Record outgoing RTT timestamp so we can compute RTT when the

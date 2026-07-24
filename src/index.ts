@@ -334,6 +334,10 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
         p.agentName = ev.agentName;
         notify(pi, `Peer identified: ${ev.peerId.slice(0, 12)}… as "${ev.agentName}"`);
       }
+      // Store extension version for async LLM compat detection
+      if (ev.extensionVersion) {
+        p.extensionVersion = ev.extensionVersion;
+      }
       // Detect stale builds: if the peer's extension version differs from ours, warn
       if (ev.extensionVersion && ev.extensionVersion !== EXTENSION_VERSION) {
         notify(
