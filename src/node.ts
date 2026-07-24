@@ -192,12 +192,6 @@ export class MeshNode {
   async start(): Promise<void> {
     if (this.isRunning) return;
 
-    // Wire internal event listeners before starting
-    this.libp2p.addEventListener("peer:discovery", this._onPeerDiscovery);
-    this.libp2p.addEventListener("peer:connect", this._onPeerConnect);
-    this.libp2p.addEventListener("peer:disconnect", this._onPeerDisconnect);
-    this.libp2p.addEventListener("peer:identify", this._onPeerIdentify);
-
     // Reset dial state for clean start
     this.pendingDials.clear();
     if (this.dialDebounceTimer) {
@@ -207,6 +201,13 @@ export class MeshNode {
 
     await this.libp2p.start();
     this.isRunning = true;
+
+    // Wire event listeners AFTER successful start to prevent
+    // duplicate listener accumulation if start() is retried after failure.
+    this.libp2p.addEventListener("peer:discovery", this._onPeerDiscovery);
+    this.libp2p.addEventListener("peer:connect", this._onPeerConnect);
+    this.libp2p.addEventListener("peer:disconnect", this._onPeerDisconnect);
+    this.libp2p.addEventListener("peer:identify", this._onPeerIdentify);
 
     // Capture listening addresses
     this.multiaddrs = this.libp2p.getMultiaddrs().map((ma) => ma.toString());
@@ -377,14 +378,21 @@ export class MeshNode {
 
   /** Dial all peers collected in pendingDials with a single batch. */
   private _flushPendingDials(): void {
+    // Snapshot the pending set atomically. New peers discovered during
+    // the flush loop will be handled by re-arming the timer below.
     const peers = [...this.pendingDials];
     this.pendingDials.clear();
 
     for (const peerIdStr of peers) {
       // Check for existing connections (real TCP state) to prevent
       // duplicate connections when both peers auto-dial simultaneously.
-      const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
-      if (connections.length > 0) continue;
+      try {
+        const connections = this.libp2p.getConnections(peerIdFromString(peerIdStr));
+        if (connections.length > 0) continue;
+      } catch {
+        // Invalid PeerId — skip to next peer
+        continue;
+      }
 
       // Also check stored status as fast-path fallback
       const stored = this.peerStore.get(peerIdStr);
@@ -405,6 +413,15 @@ export class MeshNode {
           `[MeshNode] skipped invalid peer ID ${peerIdStr.slice(0, 12)}…: ${err.message}`,
         );
       }
+    }
+
+    // Re-arm the timer if peers were discovered during the flush loop.
+    // Without this, peers discovered mid-flush would be stranded forever.
+    if (this.pendingDials.size > 0 && !this.dialDebounceTimer) {
+      this.dialDebounceTimer = setTimeout(() => {
+        this.dialDebounceTimer = null;
+        this._flushPendingDials();
+      }, MeshNode.DIAL_DEBOUNCE_MS);
     }
   }
 
@@ -448,7 +465,15 @@ export class MeshNode {
   };
 
   private _onPeerDisconnect = (evt: CustomEvent): void => {
-    const peerIdStr = evt.detail.toString();
+    let peerIdStr: string;
+    try {
+      peerIdStr = evt.detail.toString();
+      // Validate by round-tripping through peerIdFromString
+      peerIdFromString(peerIdStr);
+    } catch {
+      // Malformed PeerId — ignore (matches _onPeerConnect behavior)
+      return;
+    }
 
     const stored = this.peerStore.get(peerIdStr);
     if (stored) {

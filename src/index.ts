@@ -25,7 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshConfig, MeshNodeEvent } from "./types.js";
 import { MeshNode } from "./node.js";
 import { MeshProtocols } from "./protocols.js";
-import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemory, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
+import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemory, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, cleanupStaleRtt, RTT_CLEANUP_INTERVAL_MS, type MeshStore } from "./tools.js";
 import { AgentMemory, resolveMemoryConfig } from "./memory.js";
 import { ChromaDBLifecycle } from "./chroma-lifecycle.js";
 import { MissionControlServer } from "./mission-control-server.js";
@@ -47,6 +47,7 @@ let missionControl: MissionControlServer | null = null;
 let missionControlInterval: ReturnType<typeof setInterval> | null = null;
 let memoryHostAnnounceInterval: ReturnType<typeof setInterval> | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
+let rttCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 const store: MeshStore = {
   peers: new Map(),
@@ -509,7 +510,7 @@ export default async function (pi: ExtensionAPI) {
       // Uses a module-level FIFO resolver queue paired with the `agent_end`
       // event for reliable 1:1 request-response mapping.
 
-      const REQUEST_TIMEOUT_MS = 60_000;
+      const REQUEST_TIMEOUT_MS = 120_000;
       const MAX_QUEUE_SIZE = 50;
 
       /** Extract assistant text from an agent_end event's messages array. */
@@ -961,6 +962,11 @@ export default async function (pi: ExtensionAPI) {
         }
       }, 30_000);
 
+      // Periodic cleanup of stale RTT entries (prevents unbounded growth)
+      rttCleanupInterval = setInterval(() => {
+        cleanupStaleRtt();
+      }, RTT_CLEANUP_INTERVAL_MS);
+
       // ── Mission Control Server ─────────────────────────────────────
       // Start the HTTP+WS server for the 3D network visualization.
       // State is pushed every 2 s so the dashboard stays in sync.
@@ -1031,6 +1037,11 @@ export default async function (pi: ExtensionAPI) {
     if (pruneInterval) {
       clearInterval(pruneInterval);
       pruneInterval = null;
+    }
+    // Stop RTT cleanup
+    if (rttCleanupInterval) {
+      clearInterval(rttCleanupInterval);
+      rttCleanupInterval = null;
     }
     // Stop mission control
     if (missionControlInterval) {

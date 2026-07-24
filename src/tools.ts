@@ -73,8 +73,12 @@ export function setMeshProtocols(protocols: MeshProtocols | null): void {
 /** Module-level reference to the memory store — set by index.ts after session_start. */
 let agentMemory: AgentMemory | null = null;
 
-/** Pending outgoing RTT measurements: requestId → sendTimestamp (epoch ms). */
+/** Pending outgoing RTT measurements: requestId → sendTimestamp (epoch ms).
+ * Entries are resolved via resolveOutgoingRtt(). A periodic cleanup (every 5 min)
+ * evicts entries older than 2 minutes to prevent unbounded growth. */
 const pendingOutgoingRtt = new Map<string, number>();
+const RTT_MAX_AGE_MS = 120_000;
+const RTT_CLEANUP_INTERVAL_MS = 300_000;
 
 /** Record the send timestamp for an outgoing request — called after sendMessage() succeeds. */
 export function recordOutgoingRtt(requestId: string): void {
@@ -87,6 +91,17 @@ export function resolveOutgoingRtt(requestId: string): number | undefined {
   if (ts !== undefined) pendingOutgoingRtt.delete(requestId);
   return ts;
 }
+
+/** Evict stale RTT entries older than RTT_MAX_AGE_MS. Call periodically. */
+export function cleanupStaleRtt(): void {
+  const cutoff = Date.now() - RTT_MAX_AGE_MS;
+  for (const [id, ts] of pendingOutgoingRtt) {
+    if (ts < cutoff) pendingOutgoingRtt.delete(id);
+  }
+}
+
+/** Recommended interval for calling cleanupStaleRtt. */
+export { RTT_CLEANUP_INTERVAL_MS };
 
 /**
  * Wire the active AgentMemory instance so tools can use it.
@@ -357,8 +372,8 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
             await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
           }
         }
-        // Should never reach here — loop returns or throws
-        throw new Error("All retry attempts exhausted without response");
+        // Loop always returns or throws above — this line is unreachable
+        throw new Error("Unexpected: retry loop exited without return or throw");
       } catch (err: any) {
         const result: MeshSendResult = {
           peerId: params.peerId,

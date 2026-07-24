@@ -123,6 +123,8 @@ function setupProtocolHandler(node, name, peerId) {
       console.log(`[${name}] → reply sent`);
     } catch (err) {
       console.error(`[${name}] handler error:`, err.message);
+      // Ensure stream is closed even on error to prevent yamux stream leaks
+      try { await stream.close(); } catch { /* best-effort */ }
     }
   });
 }
