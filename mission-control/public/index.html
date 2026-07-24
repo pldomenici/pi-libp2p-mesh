@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⬡ Mesh Mission Control</title>
+<style>
+  :root {
+    --bg: #05080f;
+    --panel: rgba(7, 11, 22, 0.94);
+    --panel-alt: rgba(9, 14, 28, 0.9);
+    --text: #b0c4d8;
+    --text-dim: #4a6080;
+    --text-bright: #d8e8ff;
+    --accent: #00d4ff;
+    --accent-dim: #005577;
+    --green: #00ff88;
+    --green-dim: #005533;
+    --orange: #ff9040;
+    --orange-dim: #553311;
+    --red: #ff4060;
+    --purple: #b04dff;
+    --purple-dim: #331155;
+    --yellow: #ffd740;
+    --border: rgba(0, 180, 255, 0.1);
+    --border-bright: rgba(0, 180, 255, 0.25);
+    --font: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+    --font-ui: system-ui, -apple-system, sans-serif;
+    --shadow-glow: 0 0 20px rgba(0,210,255,0.15);
+    --radius: 6px;
+    --transition: 0.18s ease;
+  }
+  * { margin:0; padding:0; box-sizing:border-box }
+  body { background:var(--bg); overflow:hidden; font-family:var(--font); color:var(--text); }
+  canvas#bg { position:fixed; top:0; left:0; z-index:0; display:block }
+
+  /* Top Bar */
+  #topbar {
+    position:fixed; top:0; left:0; right:0; z-index:20; height:44px;
+    background:var(--panel); border-bottom:1px solid var(--border);
+    display:flex; align-items:center; padding:0 16px; gap:14px;
+    backdrop-filter:blur(12px);
+  }
+  #topbar .logo { font-size:14px; font-weight:700; letter-spacing:2px; color:var(--accent); display:flex; align-items:center; gap:7px }
+  #topbar .logo .hex { font-size:18px }
+  #topbar .logo .live { width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 10px var(--green); animation:live-pulse 2s infinite }
+  @keyframes live-pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+  #topbar .sep { width:1px; height:20px; background:var(--border) }
+  #topbar .metric { font-size:10px; color:var(--text-dim); display:flex; align-items:center; gap:5px; letter-spacing:0.5px }
+  #topbar .metric .val { color:var(--text-bright); font-weight:700; font-size:13px }
+  #topbar .metric .val.g { color:var(--green) }
+  #topbar .metric .val.o { color:var(--orange) }
+  #topbar .spacer { flex:1 }
+  #topbar .clock { font-size:11px; color:var(--text-dim) }
+
+  /* Left Panel */
+  #left {
+    position:fixed; top:44px; left:0; width:270px; bottom:0; z-index:15;
+    background:var(--panel-alt); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; backdrop-filter:blur(8px);
+  }
+  #left .head { padding:12px 14px 8px; font-size:9px; letter-spacing:2px; color:var(--text-dim); text-transform:uppercase; border-bottom:1px solid var(--border) }
+  #peer-list { flex:1; overflow-y:auto; padding:3px 0 }
+  #peer-list::-webkit-scrollbar { width:3px }
+  #peer-list::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px }
+  .peer-card {
+    margin:2px 6px; padding:9px 10px; border-radius:var(--radius); cursor:pointer;
+    border:1px solid transparent; transition:all var(--transition);
+    display:flex; flex-direction:column; gap:3px;
+  }
+  .peer-card:hover, .peer-card.sel { background:rgba(0,200,255,0.05); border-color:var(--border-bright) }
+  .peer-card .r1 { display:flex; align-items:center; gap:7px }
+  .peer-card .dot { width:7px; height:7px; border-radius:50%; flex-shrink:0 }
+  .peer-card .dot.on { background:var(--green); box-shadow:0 0 8px var(--green) }
+  .peer-card .dot.off { background:var(--red) }
+  .peer-card .name { font-weight:600; font-size:12px; color:var(--text-bright); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .peer-card .badge {
+    font-size:8px; padding:2px 5px; border-radius:2px; font-weight:700; letter-spacing:0.5px;
+    background:rgba(0,212,255,0.12); color:var(--accent);
+  }
+  .peer-card .badge.dir { background:rgba(255,215,64,0.12); color:var(--yellow) }
+  .peer-card .badge.mon { background:rgba(0,255,136,0.12); color:var(--green) }
+  .peer-card .badge.mem { background:rgba(176,77,255,0.12); color:var(--purple) }
+  .peer-card .badge.qa { background:rgba(255,144,64,0.12); color:var(--orange) }
+  .peer-card .badge.dev { background:rgba(0,212,255,0.12); color:var(--accent) }
+  .peer-card .r2 { font-size:9px; color:var(--text-dim); display:flex; gap:10px }
+  .peer-card .r3 { font-size:8px; color:var(--text-dim); overflow:hidden; white-space:nowrap; text-overflow:ellipsis }
+
+  /* Right Panel */
+  #right {
+    position:fixed; top:44px; right:0; width:310px; bottom:0; z-index:15;
+    background:var(--panel-alt); border-left:1px solid var(--border);
+    display:flex; flex-direction:column; backdrop-filter:blur(8px);
+  }
+  #right .sect { padding:10px 14px; border-bottom:1px solid var(--border) }
+  #right .sect-title { font-size:9px; letter-spacing:2px; color:var(--text-dim); text-transform:uppercase; margin-bottom:7px }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:5px }
+  .cell {
+    background:rgba(0,200,255,0.03); border-radius:var(--radius);
+    padding:7px 9px; display:flex; flex-direction:column; gap:2px;
+  }
+  .cell .lbl { font-size:8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px }
+  .cell .num { font-size:16px; font-weight:700; color:var(--accent) }
+  .cell .num.g { color:var(--green) }
+  .cell .num.o { color:var(--orange) }
+
+  /* Comm Matrix */
+  #comm-matrix { margin-top:4px; font-size:9px }
+  #comm-matrix table { width:100%; border-collapse:collapse }
+  #comm-matrix th { color:var(--text-dim); font-weight:400; font-size:8px; padding:2px 4px; text-align:left }
+  #comm-matrix td { padding:2px 4px; border-top:1px solid rgba(255,255,255,0.03); font-size:9px }
+  #comm-matrix .link { color:var(--accent) }
+  #comm-matrix .cnt { color:var(--green); text-align:right }
+  #comm-matrix .empty { color:var(--text-dim); font-style:italic; padding:8px 4px; text-align:center }
+
+  /* Sparkline */
+  #spark-container { height:44px; margin-top:4px; border-radius:var(--radius); background:rgba(0,0,0,0.3); overflow:hidden }
+  #spark { width:100%; height:100% }
+
+  /* Event Feed */
+  #events { flex:1; overflow-y:auto; padding:2px 14px 6px }
+  #events::-webkit-scrollbar { width:3px }
+  #events::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px }
+  .evt {
+    font-size:8.5px; padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.02);
+    display:flex; gap:6px; align-items:baseline;
+  }
+  .evt .ts { color:var(--text-dim); flex-shrink:0 }
+  .evt .tag { font-size:7px; padding:1px 3px; border-radius:2px; font-weight:700; flex-shrink:0; letter-spacing:0.3px }
+  .evt .tag.m { background:rgba(0,212,255,0.18); color:var(--accent) }
+  .evt .tag.bc { background:rgba(255,144,64,0.18); color:var(--orange) }
+  .evt .tag.p { background:rgba(0,255,136,0.18); color:var(--green) }
+  .evt .tag.w { background:rgba(255,64,96,0.18); color:var(--red) }
+  .evt .body { flex:1; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+
+  /* Bottom Ticker */
+  #ticker {
+    position:fixed; bottom:0; left:270px; right:310px; z-index:15;
+    height:22px; background:rgba(0,0,0,0.75); border-top:1px solid var(--border);
+    display:flex; align-items:center; padding:0 14px; font-size:9px; color:var(--text-dim); overflow:hidden;
+  }
+  #ticker .mq { white-space:nowrap; animation:scroll 28s linear infinite }
+  @keyframes scroll { 0%{transform:translateX(100%)} 100%{transform:translateX(-100%)} }
+
+  /* Tooltip */
+  #tt {
+    position:fixed; pointer-events:none; z-index:30; opacity:0; transition:opacity 0.1s;
+    background:rgba(7,11,22,0.96); border:1px solid var(--border-bright); border-radius:8px;
+    padding:10px 14px; font-size:10px; backdrop-filter:blur(12px); max-width:270px;
+  }
+  #tt.on { opacity:1 }
+  #tt .tn { font-size:13px; font-weight:700; color:var(--accent); margin-bottom:1px }
+  #tt .tr { font-size:9px; color:var(--orange); margin-bottom:5px }
+  #tt .trow { display:flex; justify-content:space-between; font-size:9px; padding:1px 0; color:var(--text-dim) }
+  #tt .trow span { color:var(--text); margin-left:16px }
+
+  /* Responsive */
+  @media (max-width:1000px) { #left { width:220px } #right { width:250px } #ticker { left:220px; right:250px } }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="logo"><span class="hex">⬡</span>MISSION CONTROL<span class="live"></span></div>
+  <div class="sep"></div>
+  <div class="metric">NODES<span class="val g" id="tb-nodes">0</span></div>
+  <div class="metric">CONN<span class="val g" id="tb-conn">0</span></div>
+  <div class="metric">MSG/s<span class="val" id="tb-rate">0</span></div>
+  <div class="metric">↓MSG<span class="val" id="tb-in">0</span></div>
+  <div class="metric">↑MSG<span class="val" id="tb-out">0</span></div>
+  <div class="metric">◇BCAST<span class="val o" id="tb-bcast">0</span></div>
+  <div class="spacer"></div>
+  <div class="clock" id="clock">00:00:00</div>
+</div>
+
+<div id="left">
+  <div class="head">▸ NETWORK NODES</div>
+  <div id="peer-list"></div>
+</div>
+
+<div id="right">
+  <div class="sect">
+    <div class="sect-title">▸ STATISTICS</div>
+    <div class="grid2">
+      <div class="cell"><span class="lbl">Total Peers</span><span class="num" id="st-peers">0</span></div>
+      <div class="cell"><span class="lbl">Connected</span><span class="num g" id="st-conn">0</span></div>
+      <div class="cell"><span class="lbl">Messages Sent</span><span class="num" id="st-sent">0</span></div>
+      <div class="cell"><span class="lbl">Messages Rcvd</span><span class="num g" id="st-recv">0</span></div>
+      <div class="cell"><span class="lbl">Broadcasts</span><span class="num o" id="st-bcast">0</span></div>
+      <div class="cell"><span class="lbl">Throughput</span><span class="num" id="st-rate">0/s</span></div>
+    </div>
+  </div>
+  <div class="sect">
+    <div class="sect-title">▸ THROUGHPUT</div>
+    <div id="spark-container"><canvas id="spark"></canvas></div>
+  </div>
+  <div class="sect">
+    <div class="sect-title">▸ COMMUNICATIONS</div>
+    <div id="comm-matrix"></div>
+  </div>
+  <div class="sect-title" style="padding:8px 14px 2px">▸ EVENT LOG</div>
+  <div id="events"></div>
+</div>
+
+<div id="ticker"><div class="mq" id="ticker-text">⬡ MESH INITIALIZING — Awaiting peer discovery...</div></div>
+<div id="tt"></div>
+
+<canvas id="bg"></canvas>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+// ── Roles ──────────────────────────────────────────────────
+const ROLE_COLORS={
+  Director:'#ffd740',Organizer:'#00d4ff','Network Monitor':'#00ff88','Memory Curator':'#b04dff',
+  'QA Engineer':'#ff9040',Developer:'#00d4ff'
+};
+const ROLE_CLASS={
+  Director:'dir',Organizer:'','Network Monitor':'mon','Memory Curator':'mem','QA Engineer':'qa',Developer:'dev'
+};
+function roleBadge(r){return r?`<span class="badge ${ROLE_CLASS[r]||''}">${r}</span>`:''}
+function roleColor(r){return ROLE_COLORS[r]||'#4a6080'}
+
+// ── Constants ──────────────────────────────────────────────
+const R=5.8,STARS=3500,SPREAD=65,MSG_SP=13,MSG_LIFE=2,MAX_EVT=100,HIST=90;
+
+// ── State ──────────────────────────────────────────────────
+const peers=new Map,particles=[];
+let selfId='',selfName='',selfNode=null,ws=null,rt=null;
+let cnt={sent:0,recv:0,bcast:0};
+let history=[],uptime=Date.now();
+
+// ── Three.js ───────────────────────────────────────────────
+const scene=new THREE.Scene();
+scene.fog=new THREE.FogExp2('#05080f',0.00016);
+const camera=new THREE.PerspectiveCamera(48,(innerWidth-580)/(innerHeight-70),0.4,200);
+camera.position.set(0,5.5,12.5); camera.lookAt(0,0,0);
+
+const renderer=new THREE.WebGLRenderer({canvas:document.getElementById('bg'),antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.25;
+renderer.setSize(innerWidth,innerHeight);
+
+const labelR=new CSS2DRenderer();
+labelR.domElement.style.cssText='position:fixed;top:0;pointer-events:none;z-index:5';
+document.body.appendChild(labelR.domElement);
+
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true; controls.dampingFactor=0.07; controls.minDistance=3; controls.maxDistance=35;
+controls.maxPolarAngle=Math.PI*0.82; controls.target.set(0,0,0); controls.update();
+
+scene.add(new THREE.AmbientLight('#1a1a3a',1.8));
+const sun=new THREE.PointLight('#00d4ff',90,35); sun.position.set(0,2.5,0); scene.add(sun);
+scene.add(new THREE.PointLight('#4422aa',25,18));
+
+// ── Nebula ─────────────────────────────────────────────────
+(function(){
+  const g=new THREE.BufferGeometry(),N=STARS,pos=new Float32Array(N*3),col=new Float32Array(N*3);
+  for(let i=0;i<N;i++){
+    const a=Math.random()*Math.PI*2,p=Math.acos(2*Math.random()-1),r=SPREAD*(0.6+Math.random()*0.4);
+    pos[i*3]=r*Math.sin(p)*Math.cos(a); pos[i*3+1]=r*Math.sin(p)*Math.sin(a); pos[i*3+2]=r*Math.cos(p);
+    const t=Math.random();
+    col[i*3]=t<0.15?0.7:t<0.3?1:t<0.45?0.65:0.3;
+    col[i*3+1]=t<0.15?0.8:t<0.3?0.45:t<0.45?0.25:0.3;
+    col[i*3+2]=t<0.15?1:t<0.3?0.2:t<0.45?1:0.45;
+  }
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color',new THREE.BufferAttribute(col,3));
+  const m=new THREE.PointsMaterial({size:0.065,vertexColors:true,transparent:true,opacity:0.7,blending:THREE.AdditiveBlending,depthWrite:false});
+  scene.add(new THREE.Points(g,m));
+})();
+
+// ── Rings ──────────────────────────────────────────────────
+for(let i=1;i<=5;i++){
+  const r=R*(i*0.22),g=new THREE.TorusGeometry(r,0.005,8,i<4?80:60);
+  const m=new THREE.MeshBasicMaterial({color:'#1a3355',transparent:true,opacity:0.07+0.02*i,depthWrite:false});
+  const ring=new THREE.Mesh(g,m); ring.rotation.x=Math.PI/2; scene.add(ring);
+}
+const mr=new THREE.Mesh(new THREE.TorusGeometry(R,0.016,16,200),new THREE.MeshBasicMaterial({color:'#00d4ff',transparent:true,opacity:0.16,depthWrite:false}));
+mr.rotation.x=Math.PI/2; mr.name='ring'; scene.add(mr);
+for(let i=0;i<24;i++){
+  const a=(i/24)*Math.PI*2,x=Math.cos(a)*R,z=Math.sin(a)*R;
+  const t=new THREE.Mesh(new THREE.CylinderGeometry(0.018,0.018,0.18,6),new THREE.MeshBasicMaterial({color:'#00d4ff',transparent:true,opacity:0.22,depthWrite:false}));
+  t.position.set(x,0,z); scene.add(t);
+}
+
+// ── Glow Textures ──────────────────────────────────────────
+function gt(color,size=128){
+  const c=document.createElement('canvas'); c.width=c.height=size;
+  const ctx=c.getContext('2d'),g=ctx.createRadialGradient(size/2,size/2,0,size/2,size/2,size/2);
+  g.addColorStop(0,color); g.addColorStop(0.12,color); g.addColorStop(0.45,'rgba(0,0,0,0.2)'); g.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=g; ctx.fillRect(0,0,size,size);
+  return new THREE.CanvasTexture(c);
+}
+const glowC=gt('#00d4ff'),glowG=gt('#00ff88'),glowR=gt('#ff4060');
+
+// ── Builders ───────────────────────────────────────────────
+function sphere(r,col,em,int=1.5){
+  return new THREE.Mesh(new THREE.SphereGeometry(r,32,32),new THREE.MeshStandardMaterial({color:col,emissive:em||col,emissiveIntensity:int,roughness:0.25,metalness:0.08}));
+}
+function sprite(r,tex,scale=5,op=0.7){
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,opacity:op}));
+  s.scale.set(r*scale,r*scale,1); return s;
+}
+function label2(txt,color,size=12){
+  const d=document.createElement('div');
+  d.textContent=txt; d.style.cssText=`color:${color};font-family:'JetBrains Mono',monospace;font-size:${size}px;font-weight:700;letter-spacing:0.5px;text-shadow:0 0 10px ${color},0 0 3px #000;white-space:nowrap;background:rgba(3,5,12,0.7);padding:2px 7px;border-radius:3px`;
+  return new CSS2DObject(d);
+}
+
+function mkPeer(name,id,st,role){
+  const g=new THREE.Group();
+  const col=st==='connected'?0x00ff88:0xff4060,em=st==='connected'?0x00aa55:0x881122;
+  const tex=st==='connected'?glowG:glowR,rc=roleColor(role);
+  const sp=sphere(0.24,col,em); const gl=sprite(0.24,tex,5.5);
+  const lb=label2(name||id.slice(0,10)+'…',st==='connected'?'#00ff88':'#ff5252');
+  lb.position.set(0,0.42,0);
+  const rg=new THREE.TorusGeometry(0.31,0.028,8,24);
+  const rm=new THREE.MeshBasicMaterial({color:rc,transparent:true,opacity:0.55,depthWrite:false});
+  const ring=new THREE.Mesh(rg,rm); ring.rotation.x=Math.PI/2;
+  g.add(sp,gl,lb,ring);
+  g.userData={peerId:id,agentName:name,status:st,sp,gl,lb,ring};
+  return g;
+}
+
+function mkSelf(name){
+  const g=new THREE.Group();
+  const sp=sphere(0.5,0x00d4ff,0x0066aa,2.2);
+  const gl=sprite(0.5,glowC,7.5,0.85);
+  const lb=label2(name,'#00d4ff',14); lb.position.set(0,0.62,0);
+  const w=new THREE.Mesh(new THREE.SphereGeometry(0.68,28,28),new THREE.MeshBasicMaterial({color:'#00d4ff',wireframe:true,transparent:true,opacity:0.14,depthWrite:false}));
+  const oring=new THREE.Mesh(new THREE.TorusGeometry(0.78,0.014,16,48),new THREE.MeshBasicMaterial({color:'#00d4ff',transparent:true,opacity:0.35,depthWrite:false}));
+  oring.rotation.set(Math.PI/2.8,Math.PI/4,0);
+  g.add(sp,gl,lb,w,oring);
+  g.userData={peerId:'__self__',agentName:name,status:'connected',sp,gl,w,oring,lb};
+  return selfNode=g;
+}
+
+function place(g,i,total){ const a=(i/total)*Math.PI*2+Math.PI*0.5; g.position.set(Math.cos(a)*R,(Math.random()-0.5)*0.9,Math.sin(a)*R) }
+function reposition(){[...peers.values()].forEach((p,i)=>place(p.group,i,peers.size))}
+
+// ── Beams ──────────────────────────────────────────────────
+const beams=new Map();
+function bk(a,b){return[a,b].sort().join('>')}
+function rebuildBeams(){
+  for(const[,b] of beams){scene.remove(b.line);b.line.geometry.dispose();b.line.material.dispose()}
+  beams.clear();
+  if(!selfNode)return;
+  for(const[,p] of peers){
+    if(p.status!=='connected')continue;
+    const k=bk('__self__',p.group.userData.peerId);
+    if(beams.has(k))continue;
+    const from=selfNode.position,to=p.group.position,mid=new THREE.Vector3().addVectors(from,to).multiplyScalar(0.5);
+    mid.y+=1.3;
+    const curve=new THREE.QuadraticBezierCurve3(from.clone(),mid,to.clone());
+    const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(40)),new THREE.LineBasicMaterial({color:'#1a4a7a',transparent:true,opacity:0.25,depthWrite:false,blending:THREE.AdditiveBlending}));
+    scene.add(line); beams.set(k,{line,curve,fromGroup:selfNode,toGroup:p.group});
+  }
+}
+
+// ── Particles ──────────────────────────────────────────────
+function spawnP(from,to,color='#00d4ff'){
+  const mesh=new THREE.Mesh(new THREE.SphereGeometry(0.055,8,8),new THREE.MeshBasicMaterial({color,transparent:true,opacity:0.95,depthWrite:false,blending:THREE.AdditiveBlending}));
+  const trail=new THREE.Mesh(new THREE.CylinderGeometry(0.014,0.038,0.32,6),new THREE.MeshBasicMaterial({color,transparent:true,opacity:0.5,depthWrite:false,blending:THREE.AdditiveBlending}));
+  mesh.add(trail); scene.add(mesh);
+  const fp=from.clone(),tp=to.clone(),mid=new THREE.Vector3().addVectors(fp,tp).multiplyScalar(0.5); mid.y+=1.3;
+  particles.push({mesh,trail,curve:new THREE.QuadraticBezierCurve3(fp,mid,tp),start:performance.now()/1000,dur:MSG_LIFE});
+}
+
+// ── Events ─────────────────────────────────────────────────
+const evEl=document.getElementById('events');
+function evt(tag,text,cls='m'){
+  const d=document.createElement('div'); d.className='evt';
+  d.innerHTML=`<span class="ts">${new Date().toTimeString().slice(0,8)}</span><span class="tag ${cls}">${tag}</span><span class="body">${text}</span>`;
+  evEl.appendChild(d); while(evEl.children.length>MAX_EVT) evEl.firstChild.remove();
+  evEl.scrollTop=evEl.scrollHeight;
+}
+
+// ── Sparkline ──────────────────────────────────────────────
+const spark=document.getElementById('spark'),ctx=spark.getContext('2d');
+function drawSpark(){
+  const W=spark.width=spark.parentElement.clientWidth,H=spark.height=spark.parentElement.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  if(history.length<2)return;
+  const max=Math.max(1,...history.map(h=>Math.max(h.s,h.r,h.b)));
+  const ws=history[history.length-1].t-HIST*1000;
+  const dr=(data,color)=>{
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=1.5;
+    let first=true;
+    for(let i=0;i<data.length;i++){
+      const x=((data[i].t-ws)/(HIST*1000))*W,y=H-(data[i].v/max)*(H-2)-1;
+      first?(ctx.moveTo(x,y),first=false):ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  };
+  dr(history.map(h=>({t:h.t,v:h.b})),'rgba(255,144,64,0.55)');
+  dr(history.map(h=>({t:h.t,v:h.s})),'rgba(0,212,255,0.55)');
+  dr(history.map(h=>({t:h.t,v:h.r})),'rgba(0,255,136,0.55)');
+}
+function pushHist(s,r,b){
+  history.push({t:Date.now(),s,r,b});
+  while(history.length>HIST*4)history.shift();
+  const recent=history.filter(h=>h.t>Date.now()-5000);
+  document.getElementById('st-rate').textContent=(recent.reduce((a,h)=>a+h.s+h.r,0)/5).toFixed(1)+'/s';
+  drawSpark();
+}
+
+// ── Peer Cards ─────────────────────────────────────────────
+const plEl=document.getElementById('peer-list');
+function renderCards(){
+  const cards=[];
+  if(selfId) cards.push({id:'__self__',name:selfName,st:'connected',role:'Director',isSelf:true,to:0,from:0});
+  for(const[,p]of peers){
+    cards.push({
+      id:p.group.userData.peerId,name:p.group.userData.agentName||p.group.userData.peerId.slice(0,10)+'…',
+      st:p.status,role:p.role||'',isSelf:false,to:p.to||0,from:p.from||0
+    });
+  }
+  cards.sort((a,b)=>a.isSelf?-1:b.isSelf?1:(a.role?'Director'===a.role?-1:'Organizer'===a.role?0:1:2)-(b.role?'Director'===b.role?-1:'Organizer'===b.role?0:1:2));
+
+  plEl.innerHTML=cards.map(c=>`
+    <div class="peer-card" data-id="${c.id}">
+      <div class="r1">
+        <span class="dot ${c.st==='connected'?'on':'off'}"></span>
+        <span class="name">${c.isSelf?'⬢ ':''}${c.name}</span>
+        ${roleBadge(c.role)}
+      </div>
+      <div class="r2">
+        <span>${c.st.toUpperCase()}${c.isSelf?' · SELF':''}</span>
+        ${!c.isSelf?`<span>↑${c.to} ↓${c.from}</span>`:''}
+      </div>
+      ${!c.isSelf?`<div class="r3">${c.id.slice(0,22)}…</div>`:''}
+    </div>
+  `).join('');
+
+  plEl.querySelectorAll('.peer-card').forEach(el=>{
+    el.addEventListener('click',()=>{
+      const id=el.dataset.id;
+      if(id&&id!=='__self__'){
+        const p=peers.get(id);
+        if(p){controls.target.lerp(p.group.position.clone(),0.5)}
+      }
+    });
+  });
+}
+
+// ── Comm Matrix ────────────────────────────────────────────
+function renderMatrix(links){
+  const el=document.getElementById('comm-matrix');
+  if(!links||links.length===0){el.innerHTML='<div class="empty">No communications yet</div>';return}
+  const rows=links.sort((a,b)=>b.lastTimestamp-a.lastTimestamp).slice(0,8).map(l=>{
+    const fn=(n)=>n?n.slice(0,12):l.from.slice(0,10);
+    const tn=(n)=>n?n.slice(0,12):l.to.slice(0,10);
+    const fromName=[...peers.values()].find(p=>p.group.userData.peerId===l.from)?.group.userData.agentName;
+    const toName=[...peers.values()].find(p=>p.group.userData.peerId===l.to)?.group.userData.agentName;
+    const fromLab=fromName||fn(fromName);
+    const toLab=toName||tn(toName);
+    return `<tr><td>${fromLab}</td><td>→</td><td>${toLab}</td><td class="cnt">${l.count}</td></tr>`;
+  }).join('');
+  el.innerHTML=`<table>${rows}</table>`;
+}
+
+// ── Ticker ─────────────────────────────────────────────────
+function ticker(txt){document.getElementById('ticker-text').textContent=txt}
+
+// ── WebSocket ──────────────────────────────────────────────
+function connect(){
+  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`);
+  ws.onopen=()=>{evt('SYS','Connected','p'); if(rt){clearTimeout(rt);rt=null}};
+  ws.onclose=()=>{evt('SYS','Disconnected','w'); rt=setTimeout(connect,2000)};
+  ws.onmessage=e=>{
+    let m; try{m=JSON.parse(e.data)}catch{return}
+    switch(m.type){case'state':onState(m.data);break;case'message':onMsg(m.data);break;case'broadcast':onBc(m.data);break}
+  };
+}
+
+// ── Handlers ───────────────────────────────────────────────
+function onState(data){
+  const{self,peers:pl,stats,commLinks}=data;
+  selfId=self.peerId; selfName=self.agentName;
+  if(!selfNode){const g=mkSelf(self.agentName);scene.add(g)}
+
+  const ids=new Set(pl.map(p=>p.peerId));
+  for(const[id,p]of peers){
+    if(!ids.has(id)){scene.remove(p.group);peers.delete(id);evt('PEER','Left: '+(p.group.userData.agentName||id.slice(0,10)),'w')}
+  }
+  pl.forEach(p=>{
+    const ex=peers.get(p.peerId);
+    if(ex){
+      if(ex.status!==p.status){
+        ex.status=p.status; ex.to=p.messagesTo; ex.from=p.messagesFrom; ex.role=p.role;
+        const col=p.status==='connected'?0x00ff88:0xff4060,em=p.status==='connected'?0x00aa55:0x881122;
+        ex.group.userData.sp.material.color.set(col); ex.group.userData.sp.material.emissive.set(em);
+        ex.group.userData.lb.element.style.color=p.status==='connected'?'#00ff88':'#ff5252';
+        evt('PEER',`${p.agentName||p.peerId.slice(0,10)}→${p.status.toUpperCase()}`,p.status==='connected'?'p':'w');
+      }
+    }else{
+      const g=mkPeer(p.agentName,p.peerId,p.status,p.role);
+      scene.add(g); peers.set(p.peerId,{group:g,agentName:p.agentName,status:p.status,role:p.role,to:p.messagesTo,from:p.messagesFrom});
+      evt('PEER',`Found: ${p.agentName||p.peerId.slice(0,10)} [${p.status}]`,'p');
+    }
+  });
+
+  reposition(); rebuildBeams(); renderCards(); renderMatrix(commLinks);
+  document.getElementById('tb-nodes').textContent=stats.totalPeers||0;
+  document.getElementById('tb-conn').textContent=stats.connectedPeers||0;
+  document.getElementById('tb-rate').textContent=(stats.messagesPerSec||0).toFixed(1);
+  document.getElementById('tb-in').textContent=stats.messagesReceived||0;
+  document.getElementById('tb-out').textContent=stats.messagesSent||0;
+  document.getElementById('tb-bcast').textContent=stats.broadcastsReceived||0;
+  document.getElementById('st-peers').textContent=stats.totalPeers||0;
+  document.getElementById('st-conn').textContent=stats.connectedPeers||0;
+  document.getElementById('st-sent').textContent=stats.messagesSent||0;
+  document.getElementById('st-recv').textContent=stats.messagesReceived||0;
+  document.getElementById('st-bcast').textContent=stats.broadcastsReceived||0;
+  cnt.sent=stats.messagesSent||0; cnt.recv=stats.messagesReceived||0; cnt.bcast=stats.broadcastsReceived||0;
+}
+
+function onMsg(data){
+  const fromG=data.from===selfId?selfNode:peers.get(data.from)?.group;
+  const toG=data.to===selfId?selfNode:peers.get(data.to)?.group;
+  if(!fromG||!toG)return;
+  spawnP(fromG,toG,data.direction==='sent'?'#00d4ff':'#00ff88');
+  const arrow=data.direction==='sent'?'→':'←',kb=(data.sizeBytes/1024).toFixed(1);
+  evt('MSG',`${arrow} ${data.fromName} ▸ ${data.toName} ${kb}KB`);
+  if(data.direction==='sent')cnt.sent++; else cnt.recv++;
+  pushHist(cnt.sent,cnt.recv,cnt.bcast);
+  document.getElementById('tb-in').textContent=cnt.recv; document.getElementById('tb-out').textContent=cnt.sent;
+  ticker(`⬡ MSG ${arrow} ${data.fromName} ▸ ${data.toName} · ${kb}KB · ${data.direction==='sent'?'OUT':'IN'}`);
+}
+
+function onBc(data){
+  const fromG=data.from===selfId?selfNode:peers.get(data.from)?.group;
+  if(!fromG)return;
+  for(const[,p] of peers){if(p.status==='connected')spawnP(fromG,p.group,'#ff9040')}
+  if(selfNode&&fromG!==selfNode)spawnP(fromG,selfNode,'#ff9040');
+  const pre=(data.message||'').slice(0,60);
+  evt('BCAST',`⬡ ${data.fromName}: ${pre}`,'bc');
+  cnt.bcast++; pushHist(cnt.sent,cnt.recv,cnt.bcast);
+  document.getElementById('tb-bcast').textContent=cnt.bcast;
+  ticker(`⬡ BROADCAST from ${data.fromName}: ${pre}${pre.length>=60?'…':''}`);
+}
+
+// ── Tooltip ────────────────────────────────────────────────
+const tt=document.getElementById('tt'),ray=new THREE.Raycaster(),mpos=new THREE.Vector2();
+addEventListener('mousemove',e=>{
+  mpos.x=(e.clientX/innerWidth)*2-1; mpos.y=-(e.clientY/innerHeight)*2+1;
+  ray.setFromCamera(mpos,camera);
+  const tgts=[]; if(selfNode)tgts.push(selfNode);
+  for(const[,p]of peers)tgts.push(p.group);
+  const hits=ray.intersectObjects(tgts,true);
+  if(hits.length){
+    let o=hits[0].object; while(o&&!o.userData?.peerId)o=o.parent;
+    if(o?.userData?.peerId){
+      const d=o.userData,isSelf=d.peerId==='__self__';
+      const pem=peers.get(d.peerId);
+      tt.innerHTML=`
+        <div class="tn">${isSelf?'⬢ ':''}${d.agentName||'?'}</div>
+        <div class="tr">${pem?.role||'Peer'}${isSelf?' · SELF':''}</div>
+        <div class="trow">STATUS<span>${d.status?.toUpperCase()}</span></div>
+        ${!isSelf?`<div class="trow">MSG ↑<span>${pem?.to||0}</span></div><div class="trow">MSG ↓<span>${pem?.from||0}</span></div>`:''}
+        ${!isSelf?`<div class="trow" style="font-size:7px;word-break:break-all">ID<span style="max-width:140px;text-align:right">${d.peerId}</span></div>`:''}
+      `;
+      tt.className='on'; tt.style.left=(e.clientX+18)+'px'; tt.style.top=(e.clientY-20)+'px';
+      return;
+    }
+  }
+  tt.className='';
+});
+
+// ── Click ──────────────────────────────────────────────────
+renderer.domElement.addEventListener('click',e=>{
+  mpos.x=(e.clientX/innerWidth)*2-1; mpos.y=-(e.clientY/innerHeight)*2+1;
+  ray.setFromCamera(mpos,camera);
+  const tgts=[]; if(selfNode)tgts.push(selfNode);
+  for(const[,p]of peers)tgts.push(p.group);
+  const hits=ray.intersectObjects(tgts,true);
+  if(hits.length){
+    let o=hits[0].object; while(o&&!o.userData?.peerId)o=o.parent;
+    if(o?.userData?.peerId&&o.userData.peerId!=='__self__'){
+      const p=peers.get(o.userData.peerId);
+      if(p)controls.target.lerp(p.group.position.clone(),0.5);
+    }
+  }
+});
+
+// ── Animation ──────────────────────────────────────────────
+const clock=new THREE.Clock();
+function anim(){
+  requestAnimationFrame(anim);
+  const dt=Math.min(clock.getDelta(),0.1),t=performance.now()/1000;
+  controls.update();
+  if(selfNode){
+    selfNode.userData.sp.scale.setScalar(1+Math.sin(t*2.8)*0.05);
+    selfNode.userData.w.rotation.y+=dt*0.35; selfNode.userData.w.rotation.x+=dt*0.18;
+    selfNode.userData.oring.rotation.z+=dt*0.4;
+  }
+  const ring=scene.getObjectByName('ring'); if(ring)ring.rotation.z+=dt*0.07;
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i],prog=Math.min((t-p.start)/p.dur,1);
+    if(prog>=1){scene.remove(p.mesh);p.mesh.geometry.dispose();p.mesh.material.dispose();particles.splice(i,1);continue}
+    p.mesh.position.copy(p.curve.getPointAt(prog));
+    p.trail.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),p.curve.getTangentAt(Math.max(prog,0.001)).normalize());
+    const a=prog<0.7?0.95:0.95*(1-(prog-0.7)/0.3);
+    p.mesh.material.opacity=a; p.trail.material.opacity=a*0.5;
+  }
+  for(const[,b] of beams){
+    const f=b.fromGroup.position,t=b.toGroup.position,mid=new THREE.Vector3().addVectors(f,t).multiplyScalar(0.5);mid.y+=1.3;
+    b.curve=new THREE.QuadraticBezierCurve3(f.clone(),mid,t.clone());
+    b.line.geometry.setFromPoints(b.curve.getPoints(40));
+  }
+  renderer.render(scene,camera); labelR.render(scene,camera);
+}
+
+// ── Clock ──────────────────────────────────────────────────
+function tick(){ document.getElementById('clock').textContent=new Date().toTimeString().slice(0,8) }
+setInterval(tick,1000);
+
+addEventListener('resize',()=>{
+  camera.aspect=(innerWidth-580)/(innerHeight-70); camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight); labelR.setSize(innerWidth,innerHeight); drawSpark();
+});
+
+connect(); anim(); tick();
+console.log('%c⬡ MISSION CONTROL %cOPERATIONAL','color:#00d4ff;font-size:18px','color:#b0c4d8');
+</script>
+</body>
+</html>

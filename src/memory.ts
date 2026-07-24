@@ -105,7 +105,18 @@ export class AgentMemory {
           `[pi-libp2p-mesh] AgentMemory connected to ChromaDB at ${host}:${port}, collection "${collectionName}"`,
         );
 
-        return new AgentMemory(client, embedder, collection, collectionName, agentName, config);
+        const memory = new AgentMemory(client, embedder, collection, collectionName, agentName, config);
+
+        // Warm up the embedding model in the background so the first real
+        // store()/search() call doesn't incur the WASM model download latency
+        // (all-MiniLM-L6-v2 is ~80 MB and downloads lazily on first embed).
+        memory._warmupEmbedder().catch((err) => {
+          console.debug(
+            `[pi-libp2p-mesh] Embedding warmup failed (non-fatal): ${err.message}`,
+          );
+        });
+
+        return memory;
       } catch (err: any) {
         lastErr = err;
         if (attempt < AgentMemory.CONNECT_RETRIES) {
@@ -415,6 +426,24 @@ export class AgentMemory {
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
+
+  /**
+   * Pre-load the embedding model so the first real store()/search() call
+   * isn't delayed by the ~80 MB WASM model download. Fire-and-forget —
+   * failures are logged at debug level and are non-fatal.
+   */
+  private async _warmupEmbedder(): Promise<void> {
+    const WARMUP_TIMEOUT_MS = 30_000;
+
+    // Wrap in a race with a timeout so warmup never blocks the process exit
+    const warmup = this.embedder.generate(["warmup"]);
+    const timeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error("warmup timed out")), WARMUP_TIMEOUT_MS),
+    );
+
+    await Promise.race([warmup, timeout]);
+    console.debug("[pi-libp2p-mesh] Embedding model warmed up");
+  }
 
   /**
    * Manually refresh the collection reference. Use after ChromaDB restarts

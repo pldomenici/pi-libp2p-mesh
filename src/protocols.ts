@@ -13,7 +13,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { encode, decode } from 'cborg';
 import type { Libp2p, Stream } from '@libp2p/interface';
-import type { GossipsubMessage } from '@chainsafe/libp2p-gossipsub';
+import type { GossipsubMessage } from '@libp2p/gossipsub';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import type {
   AgentRequest,
@@ -56,7 +56,7 @@ async function readStream(
     const chunk =
       raw instanceof Uint8Array
         ? raw
-        : (raw as Uint8ArrayList).subarray();
+        : (raw as unknown as Uint8ArrayList).subarray();
     chunks.push(chunk);
     totalBytes += chunk.byteLength;
   }
@@ -414,36 +414,59 @@ export class MeshProtocols {
       }
       const request: AgentRequest = decode(raw) as AgentRequest;
 
-      let responseMessage: string;
-
-      if (request.autoReply === true) {
-        // Explicit auto-reply: echo without involving the LLM
-        responseMessage = `[auto-response] Received: "${request.message}"`;
-      } else if (this._onRequest) {
-        // Forward to LLM (default behavior when autoReply is not true)
-        responseMessage = await this._onRequest(peerIdStr, request);
-      } else {
-        // Fallback: no LLM handler registered
-        responseMessage = `[auto-response] Received (no LLM handler): "${request.message}"`;
-      }
-
-      const response: AgentResponse = {
-        requestId: request.requestId,
-        fromAgent: this.config.agentName,
-        fromPeerId: this.libp2p.peerId.toString(),
-        timestamp: Date.now(),
-        message: responseMessage,
-        error: false,
-      };
-
-      // Write the response back (v3: send); the finally block handles close.
-      stream.send(encode(response));
-
-      // Notify the registered callback (for logging/side effects)
-      // Wrap in Promise.resolve to catch any async rejections
+      // Notify onMessage callback (logging / side effects)
       Promise.resolve(this._onMessage?.(peerIdStr, request)).catch((err) => {
         console.error('[mesh-protocols] onMessage handler error:', err);
       });
+
+      if (request.autoReply === true) {
+        // Explicit auto-reply: echo without involving the LLM
+        const response: AgentResponse = {
+          requestId: request.requestId,
+          fromAgent: this.config.agentName,
+          fromPeerId: this.libp2p.peerId.toString(),
+          timestamp: Date.now(),
+          message: `[auto-response] Received: "${request.message}"`,
+          error: false,
+        };
+        stream.send(encode(response));
+      } else if (this._onRequest) {
+        // ── Async LLM processing ───────────────────────────────────────
+        // Write ACK immediately so the sender doesn't block on our LLM
+        // (which may take 10-60s). The real response arrives later via a
+        // follow-up mesh_send with responseToRequestId set.
+        const ack: AgentResponse = {
+          requestId: request.requestId,
+          fromAgent: this.config.agentName,
+          fromPeerId: this.libp2p.peerId.toString(),
+          timestamp: Date.now(),
+          message: `[queued] Accepted — response will arrive asynchronously`,
+          error: false,
+          queued: true,
+        };
+        stream.send(encode(ack));
+        await stream.close();
+
+        // Fire-and-forget: process through LLM. The callback is responsible
+        // for sending the response back via mesh_send.
+        this._onRequest(peerIdStr, request).catch((err) =>
+          console.error('[mesh-protocols] async onRequest error:', err),
+        );
+
+        // Skip the normal response+close path below (stream already closed)
+        return;
+      } else {
+        // Fallback: no LLM handler registered
+        const response: AgentResponse = {
+          requestId: request.requestId,
+          fromAgent: this.config.agentName,
+          fromPeerId: this.libp2p.peerId.toString(),
+          timestamp: Date.now(),
+          message: `[auto-response] Received (no LLM handler): "${request.message}"`,
+          error: false,
+        };
+        stream.send(encode(response));
+      }
     } catch (err) {
       // M2: Write an error response so the sender fails fast (<100ms)
       // instead of waiting for its full 30s timeout.

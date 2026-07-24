@@ -73,6 +73,21 @@ export function setMeshProtocols(protocols: MeshProtocols | null): void {
 /** Module-level reference to the memory store — set by index.ts after session_start. */
 let agentMemory: AgentMemory | null = null;
 
+/** Pending outgoing RTT measurements: requestId → sendTimestamp (epoch ms). */
+const pendingOutgoingRtt = new Map<string, number>();
+
+/** Record the send timestamp for an outgoing request — called after sendMessage() succeeds. */
+export function recordOutgoingRtt(requestId: string): void {
+  pendingOutgoingRtt.set(requestId, Date.now());
+}
+
+/** Look up and remove a pending RTT timestamp. Returns undefined if not found. */
+export function resolveOutgoingRtt(requestId: string): number | undefined {
+  const ts = pendingOutgoingRtt.get(requestId);
+  if (ts !== undefined) pendingOutgoingRtt.delete(requestId);
+  return ts;
+}
+
 /**
  * Wire the active AgentMemory instance so tools can use it.
  * Called from index.ts after session_start.
@@ -275,13 +290,18 @@ export function registerMeshTools(pi: ExtensionAPI, store: MeshStore): void {
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           try {
+            const requestId = uuidv4();
             const response = await meshProtocols.sendMessage(params.peerId, {
               protocol: "/pi-agent/0.1.0",
-              requestId: uuidv4(),
+              requestId,
               fromAgent: store.agentName,
               message: params.message,
               autoReply: params.autoReply,
             });
+
+            // Record outgoing RTT timestamp so we can compute RTT when the
+            // async response arrives (via responseToRequestId in onRequest).
+            recordOutgoingRtt(requestId);
 
             // Success — handle response inline, no post-loop assertion needed
 

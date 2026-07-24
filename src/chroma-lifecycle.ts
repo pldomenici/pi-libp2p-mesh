@@ -29,6 +29,7 @@ export class ChromaDBLifecycle {
 
   private childProcess: ChildProcess | null = null;
   private startedByUs: boolean = false;
+  private _aborted: boolean = false;
 
   constructor(config: ChromaDBLifecycleConfig) {
     this.config = config;
@@ -136,6 +137,8 @@ export class ChromaDBLifecycle {
       this.childProcess = proc;
       this.startedByUs = true;
 
+      this._aborted = false;
+
       // Wait for ChromaDB to be ready (poll up to 15s)
       const ready = await this._waitUntilReady(15_000);
       if (ready) {
@@ -160,10 +163,19 @@ export class ChromaDBLifecycle {
   // ── Stop ───────────────────────────────────────────────────────────────────
 
   /**
+   * Abort an in-progress ensureRunning() — sets a flag that the readiness
+   * poll checks, so it bails out early instead of waiting the full 15 s.
+   */
+  abort(): void {
+    this._aborted = true;
+  }
+
+  /**
    * Stop the ChromaDB child process if we started it.
    * Sends SIGTERM and gives it 5s to exit gracefully before SIGKILL.
    */
   stop(): void {
+    this._aborted = true;
     if (!this.childProcess || !this.startedByUs) return;
 
     const proc = this.childProcess;
@@ -196,17 +208,29 @@ export class ChromaDBLifecycle {
   private async _waitUntilReady(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     const pollInterval = 300;
+    const logInterval = 3_000; // log progress every 3s
+    let lastLog = 0;
 
     // Give it an initial grace period before polling
     await new Promise((r) => setTimeout(r, 800));
 
     while (Date.now() < deadline) {
       // If the child process died, give up immediately
+      if (this._aborted) return false;
       if (this.childProcess?.exitCode !== null && this.childProcess?.exitCode !== undefined) {
         return false;
       }
 
       if (await this.isRunning()) return true;
+
+      const elapsed = Date.now() - (deadline - timeoutMs);
+      if (elapsed - lastLog >= logInterval) {
+        lastLog = elapsed;
+        console.log(
+          `[pi-libp2p-mesh] Waiting for ChromaDB to start… (${Math.round(elapsed / 1000)}s elapsed)`,
+        );
+      }
+
       await new Promise((r) => setTimeout(r, pollInterval));
     }
 

@@ -53,6 +53,12 @@ export interface AgentRequest {
   timeoutMs?: number;
   /** Extension version of the sender — for stale-build detection. */
   extensionVersion?: string;
+  /**
+   * When set, this message is an async response to a previous request.
+   * The receiver should route it to the original requester's pending callback
+   * instead of queueing it for LLM processing.
+   */
+  responseToRequestId?: string;
 }
 
 export interface AgentResponse {
@@ -64,10 +70,12 @@ export interface AgentResponse {
   fromPeerId: string;
   /** Timestamp (epoch ms) */
   timestamp: number;
-  /** The response text */
+  /** The response text (or "[queued]" if accepted but LLM hasn't responded yet) */
   message: string;
   /** Whether the responder encountered an error */
   error: boolean;
+  /** If true, the request was queued for LLM processing and a follow-up response will arrive asynchronously. */
+  queued?: boolean;
 }
 
 /** GossipSub message envelope */

@@ -15,7 +15,7 @@ import { mdns } from "@libp2p/mdns";
 import { identify } from "@libp2p/identify";
 import { kadDHT, removePrivateAddressesMapper } from "@libp2p/kad-dht";
 import { bootstrap } from "@libp2p/bootstrap";
-import { gossipsub } from "@chainsafe/libp2p-gossipsub";
+import { gossipsub } from "@libp2p/gossipsub";
 import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { preSharedKey } from "@libp2p/pnet";

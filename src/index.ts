@@ -28,6 +28,8 @@ import { MeshProtocols } from "./protocols.js";
 import { registerMeshTools, registerMemoryTools, setMeshProtocols, setAgentMemory, listPeers, pruneAllDisconnected, pruneStalePeers, recordBroadcast, type MeshStore } from "./tools.js";
 import { AgentMemory, resolveMemoryConfig } from "./memory.js";
 import { ChromaDBLifecycle } from "./chroma-lifecycle.js";
+import { MissionControlServer } from "./mission-control-server.js";
+import type { MeshState, MessageFlow, BroadcastFlow } from "./mission-control-server.js";
 import os from "node:os";
 
 /** Extension version — reported via Identify protocol for stale-build detection. */
@@ -41,6 +43,8 @@ let meshNode: MeshNode | null = null;
 let meshProtocols: MeshProtocols | null = null;
 let agentMemory: AgentMemory | null = null;
 let chromaLifecycle: ChromaDBLifecycle | null = null;
+let missionControl: MissionControlServer | null = null;
+let missionControlInterval: ReturnType<typeof setInterval> | null = null;
 let memoryHostAnnounceInterval: ReturnType<typeof setInterval> | null = null;
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -50,6 +54,24 @@ const store: MeshStore = {
   agentName: "", // set during extension init after flag is read
   peerId: "",    // set after mesh node starts
   autoReplyAll: false, // when true, all incoming messages auto-reply without LLM
+};
+
+// Mission-control stats (cumulative counters)
+const mcStats = {
+  messagesSent: 0,
+  messagesReceived: 0,
+  broadcastsSent: 0,
+  broadcastsReceived: 0,
+  errors: 0,
+  timeouts: 0,
+  /** Track per-peer message counts: peerId → {sent, received} */
+  peerMessages: new Map<string, { sent: number; received: number }>(),
+  /** Communication links: "fromId→toId" → { count, lastTimestamp, totalRtt, rttSamples } */
+  commLinks: new Map<string, { count: number; lastTimestamp: number; totalRtt: number; rttSamples: number }>(),
+  /** Timestamps of recent messages for rate calculation */
+  recentMsgTimestamps: [] as number[],
+  /** Pending RTT measurements: requestId → sendTimestamp */
+  pendingRtt: new Map<string, number>(),
 };
 
 /** A pending LLM request awaiting agent_end resolution. */
@@ -99,6 +121,98 @@ function resolveLocalIp(libp2p: any): string | null {
   return null;
 }
 
+/** Role registry — maps agent names to their assigned roles. */
+const AGENT_ROLES: Record<string, string> = {
+  'alpha': 'Organizer',
+  'pi-fedora-laptop': 'Director',
+  'bravo': 'Network Monitor',
+  'charlie': 'Memory Curator',
+  'delta': 'QA Engineer',
+  'blair': 'Developer',
+};
+
+/** Build a full MeshState snapshot for the mission-control dashboard. */
+function buildMissionControlState(): MeshState {
+  const peerList = [];
+  for (const [id, p] of store.peers) {
+    if (id === store.peerId) continue; // skip self
+    const pm = mcStats.peerMessages.get(id);
+    peerList.push({
+      peerId: id,
+      agentName: p.agentName,
+      status: p.status,
+      addresses: p.addresses,
+      discoveredAt: p.discoveredAt,
+      disconnectedAt: p.disconnectedAt,
+      messagesTo: pm?.sent ?? 0,
+      messagesFrom: pm?.received ?? 0,
+      role: p.agentName ? AGENT_ROLES[p.agentName] : undefined,
+    });
+  }
+
+  // Add untracked libp2p connections (peers connected but not yet in store)
+  if (meshNode) {
+    try {
+      const connPeers: string[] = meshNode.libp2p.getPeers?.()?.map((p: any) => p.toString()) ?? [];
+      for (const cp of connPeers) {
+        if (cp === store.peerId) continue;
+        if (!store.peers.has(cp)) {
+          peerList.push({
+            peerId: cp,
+            agentName: undefined,
+            status: "connected" as const,
+            addresses: [],
+            discoveredAt: Date.now(),
+            messagesTo: 0,
+            messagesFrom: 0,
+          });
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  const connectedPeers = store.peers.size > 0
+    ? [...store.peers.values()].filter(p => p.status === "connected" && p.id !== store.peerId).length
+    : 0;
+
+  // Compute messages per second over last 5 seconds
+  const now = Date.now();
+  mcStats.recentMsgTimestamps = mcStats.recentMsgTimestamps.filter(t => now - t < 5000);
+  const msgPerSec = mcStats.recentMsgTimestamps.length / 5;
+
+  // Comm links
+  const commLinks = [...mcStats.commLinks.entries()].map(([key, val]) => {
+    const [from, to] = key.split('→');
+    const avgRttMs = val.rttSamples > 0
+      ? Math.round(val.totalRtt / val.rttSamples * 10) / 10
+      : 0;
+    return { from, to, count: val.count, lastTimestamp: val.lastTimestamp, avgRttMs };
+  });
+
+  return {
+    self: {
+      peerId: store.peerId,
+      agentName: store.agentName,
+      addresses: resolveLocalIp(meshNode?.libp2p)
+        ? [resolveLocalIp(meshNode!.libp2p)!]
+        : [],
+    },
+    peers: peerList,
+    stats: {
+      totalPeers: store.peers.size > 0 ? store.peers.size - 1 : 0, // exclude self
+      connectedPeers,
+      messagesSent: mcStats.messagesSent,
+      messagesReceived: mcStats.messagesReceived,
+      broadcastsSent: mcStats.broadcastsSent,
+      broadcastsReceived: mcStats.broadcastsReceived,
+      messagesPerSec: Math.round(msgPerSec * 10) / 10,
+      pendingQueueDepth: pendingResolvers.length,
+      errors: mcStats.errors,
+    },
+    commLinks,
+  };
+}
+
 function buildConfig(pi: ExtensionAPI): MeshConfig {
   const swarmKeyPath =
     (pi.getFlag("mesh-swarm-key") as string) ||
@@ -119,6 +233,36 @@ function buildConfig(pi: ExtensionAPI): MeshConfig {
     chromaDataPath: (pi.getFlag("mesh-chroma-data-path") as string) ||
       process.env.CHROMA_DATA_PATH || undefined,
   };
+}
+
+/** Record an incoming message for per-peer & comm-link tracking. */
+function recordMsgReceived(fromPeerId: string) {
+  const pm = mcStats.peerMessages.get(fromPeerId) ?? { sent: 0, received: 0 };
+  pm.received++;
+  mcStats.peerMessages.set(fromPeerId, pm);
+  mcStats.recentMsgTimestamps.push(Date.now());
+
+  // Comm link tracking (reverse direction)
+  const linkKey = `${fromPeerId}→${store.peerId}`;
+  const existing = mcStats.commLinks.get(linkKey) ?? { count: 0, lastTimestamp: 0, totalRtt: 0, rttSamples: 0 };
+  existing.count++;
+  existing.lastTimestamp = Date.now();
+  mcStats.commLinks.set(linkKey, existing);
+}
+
+/** Record an outgoing message for per-peer & comm-link tracking. */
+function recordMsgSent(toPeerId: string) {
+  const pm = mcStats.peerMessages.get(toPeerId) ?? { sent: 0, received: 0 };
+  pm.sent++;
+  mcStats.peerMessages.set(toPeerId, pm);
+  mcStats.recentMsgTimestamps.push(Date.now());
+
+  // Comm link tracking
+  const linkKey = `${store.peerId}→${toPeerId}`;
+  const existing = mcStats.commLinks.get(linkKey) ?? { count: 0, lastTimestamp: 0, totalRtt: 0, rttSamples: 0 };
+  existing.count++;
+  existing.lastTimestamp = Date.now();
+  mcStats.commLinks.set(linkKey, existing);
 }
 
 // ── Event Handler ────────────────────────────────────────────────────────────
@@ -156,6 +300,10 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
       } else {
         p.status = "connected";
       }
+      // Push immediate state update to mission control
+      if (missionControl) {
+        missionControl.updateState(buildMissionControlState());
+      }
       notify(pi, `Peer connected: ${ev.peerId}`);
       break;
     }
@@ -163,6 +311,9 @@ function handleNodeEvent(pi: ExtensionAPI, ev: MeshNodeEvent) {
     case "peer:disconnected": {
       const p = store.peers.get(ev.peerId);
       if (p) { p.status = "disconnected"; p.disconnectedAt = Date.now(); }
+      if (missionControl) {
+        missionControl.updateState(buildMissionControlState());
+      }
       notify(pi, `Peer disconnected: ${ev.peerId}`);
       break;
     }
@@ -293,6 +444,13 @@ export default async function (pi: ExtensionAPI) {
     type: "string",
     default: "",
   });
+  pi.registerFlag("mesh-mc-port", {
+    description:
+      "Port for the mission-control 3D network dashboard (default: 9191). " +
+      "Starts automatically on session_start.",
+    type: "string",
+    default: "",
+  });
 
   // 1. Session lifecycle: start node
   pi.on("session_start", async (_event, ctx) => {
@@ -387,9 +545,66 @@ export default async function (pi: ExtensionAPI) {
 
       // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
       meshProtocols.onRequest = async (peerId, request) => {
+        // ── Async response delivery ───────────────────────────────────
+        // When responseToRequestId is set, this is an async response to a
+        // previous request we sent. Store silently in memory — do NOT
+        // trigger an LLM turn (which would create a bottleneck when multiple
+        // responses arrive simultaneously). The LLM retrieves responses via
+        // memory context injection on its next interaction.
+        if (request.responseToRequestId) {
+          const peer = store.peers.get(peerId);
+
+          // Store response in memory for future retrieval (silent, no LLM turn)
+          if (agentMemory) {
+            agentMemory.store({
+              peerId,
+              key: "async_response",
+              value: `[Response from ${request.fromAgent} (re: ${request.responseToRequestId})] ${request.message}`,
+              metadata: { type: "async_response", requestId: request.responseToRequestId, fromAgent: request.fromAgent },
+            }).catch((err) => console.warn("[pi-libp2p-mesh] async response store failed:", (err as Error).message));
+          }
+
+          // Emit to mission control
+          if (missionControl) {
+            const flow: MessageFlow = {
+              from: peerId,
+              fromName: peer?.agentName ?? peerId.slice(0, 12) + "…",
+              to: store.peerId,
+              toName: store.agentName,
+              direction: "received",
+              sizeBytes: Buffer.byteLength(request.message, "utf-8"),
+              timestamp: Date.now(),
+            };
+            missionControl.emitMessage(flow);
+          }
+          mcStats.messagesReceived++;
+          recordMsgReceived(peerId);
+
+          // Auto-ACK — don't queue an LLM turn for this delivery
+          return `[received] Async response stored in memory`;
+        }
+
         // If global auto-reply-all is on, echo without LLM
         if (store.autoReplyAll) {
           return `[auto-reply-all] Received: "${request.message}"`;
+        }
+
+        mcStats.messagesReceived++;
+        recordMsgReceived(peerId);
+
+        // Emit message flow to mission control
+        if (missionControl) {
+          const peer = store.peers.get(peerId);
+          const flow: MessageFlow = {
+            from: peerId,
+            fromName: peer?.agentName ?? peerId.slice(0, 12) + "…",
+            to: store.peerId,
+            toName: store.agentName,
+            direction: "received",
+            sizeBytes: Buffer.byteLength(request.message, "utf-8"),
+            timestamp: Date.now(),
+          };
+          missionControl.emitMessage(flow);
         }
 
         // Backpressure: reject the request immediately if queue is full
@@ -429,6 +644,52 @@ export default async function (pi: ExtensionAPI) {
           // Fire off the LLM request — agent_end will resolve our promise
           pi.sendUserMessage(userMessage, { deliverAs: "steer" });
         }).then((responseText) => {
+          mcStats.messagesSent++;
+          recordMsgSent(peerId);
+          if (missionControl) {
+            const peer = store.peers.get(peerId);
+            const flow: MessageFlow = {
+              from: store.peerId,
+              fromName: store.agentName,
+              to: peerId,
+              toName: peer?.agentName ?? peerId.slice(0, 12) + "…",
+              direction: "sent",
+              sizeBytes: Buffer.byteLength(responseText, "utf-8"),
+              timestamp: Date.now(),
+            };
+            missionControl.emitMessage(flow);
+          }
+
+          // ── Send async response back to requester ─────────────────
+          // Instead of holding the stream open for 10-60s waiting for the
+          // LLM, we already ACK'd the stream immediately in protocols.ts.
+          // Now we deliver the real response via a follow-up mesh_send.
+
+          // Track RTT: elapsed from sender's original request timestamp to now.
+          const rtt = Date.now() - request.timestamp;
+          const rttLinkKey = `${store.peerId}→${peerId}`;
+          let rttLink = mcStats.commLinks.get(rttLinkKey);
+          if (!rttLink) {
+            rttLink = { count: 0, lastTimestamp: 0, totalRtt: 0, rttSamples: 0 };
+            mcStats.commLinks.set(rttLinkKey, rttLink);
+          }
+          rttLink.totalRtt += rtt;
+          rttLink.rttSamples++;
+
+          if (meshProtocols) {
+            meshProtocols.sendMessage(peerId, {
+              protocol: "/pi-agent/0.1.0",
+              requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+              fromAgent: store.agentName,
+              message: responseText,
+              // responseToRequestId tells the receiver this is an async
+              // response — it forwards to LLM and auto-ACKs (no LLM loop).
+              responseToRequestId: request.requestId,
+            }).catch((err) => {
+              console.warn("[pi-libp2p-mesh] Failed to deliver async response:", (err as Error).message);
+            });
+          }
+
           // Auto-save exchange to memory (fire-and-forget, non-blocking)
           if (agentMemory) {
             agentMemory.store({
@@ -460,6 +721,21 @@ export default async function (pi: ExtensionAPI) {
             `[Mesh broadcast from ${msg.fromAgent} (${msg.type ?? "announce"})]\n\n${msg.message}`,
             { deliverAs: "steer" },
           );
+        }
+
+        mcStats.broadcastsReceived++;
+        recordMsgReceived(msg.fromPeerId);
+
+        // Emit broadcast flow to mission control
+        if (missionControl) {
+          const flow: BroadcastFlow = {
+            from: msg.fromPeerId,
+            fromName: msg.fromAgent,
+            message: msg.message,
+            type: msg.type,
+            timestamp: Date.now(),
+          };
+          missionControl.emitBroadcast(flow);
         }
 
         // Auto-save broadcast to memory
@@ -549,26 +825,19 @@ export default async function (pi: ExtensionAPI) {
       // ── ChromaDB Host Election ───────────────────────────────────────
       // First node to start becomes the host. Others connect to it.
       // Discovery is via GossipSub on the "pi-memory-host" topic.
+      //
+      // Local ChromaDB start runs in parallel with listening for remote
+      // host announcements — whichever resolves first wins. This eliminates
+      // the fixed 2.5 s delay when a solo agent starts up.
       const defaultHost = config.chromaHost ?? "localhost";
       const defaultPort = config.chromaPort ?? 8000;
       let resolvedHost = defaultHost;
       let resolvedPort = defaultPort;
       let isMemoryHost = false;
-      let hostDiscovered = false;
+      let hostResolved = false; // set when we definitively pick local or remote
 
       // Resolve the local IP we'll advertise if we become the host
       const localIp = resolveLocalIp(meshNode.libp2p);
-
-      // Subscribe to host announcements from other peers
-      meshProtocols.subscribeRawTopic<import("./types.js").MemoryHostAnnouncement>(
-        "pi-memory-host",
-        (announcement) => {
-          hostDiscovered = true;
-          resolvedHost = announcement.host;
-          resolvedPort = announcement.port;
-          notify(pi, `Discovered ChromaDB host: ${announcement.fromAgent} at ${announcement.host}:${announcement.port}`);
-        },
-      );
 
       chromaLifecycle = new ChromaDBLifecycle({
         host: defaultHost,
@@ -577,51 +846,85 @@ export default async function (pi: ExtensionAPI) {
         dataPath: config.chromaDataPath,
       });
 
-      // First check if ChromaDB is already running locally
-      const localRunning = await chromaLifecycle.isRunning();
+      // Subscribe to host announcements from other peers.
+      // If a remote host announces before our local start completes, we
+      // abort our local start and connect to the remote host instead.
+      meshProtocols.subscribeRawTopic<import("./types.js").MemoryHostAnnouncement>(
+        "pi-memory-host",
+        (announcement) => {
+          if (hostResolved) return; // already decided — ignore late announcements
+          hostResolved = true;
+          resolvedHost = announcement.host;
+          resolvedPort = announcement.port;
+          isMemoryHost = false;
+          chromaLifecycle!.abort(); // cancel any in-progress local start
+          notify(pi, `Discovered ChromaDB host: ${announcement.fromAgent} at ${announcement.host}:${announcement.port}`);
+        },
+      );
 
-      if (localRunning) {
-        // ChromaDB already on localhost — we're the host. Announce it.
-        resolvedHost = localIp ?? defaultHost;
-        resolvedPort = defaultPort;
-        isMemoryHost = true;
-        notify(pi, `ChromaDB already running locally — announcing as host at ${resolvedHost}:${resolvedPort}`);
+      // Helper: announce ourselves as the ChromaDB host
+      const announceAsHost = async () => {
         const announcement: import("./types.js").MemoryHostAnnouncement = {
           type: "memory:host",
           host: resolvedHost,
           port: resolvedPort,
           fromAgent: store.agentName,
-          fromPeerId: meshNode.peerId,
+          fromPeerId: meshNode!.peerId,
           timestamp: Date.now(),
         };
-        await meshProtocols.publishRawTopic("pi-memory-host", announcement);
-      } else {
-        // No local ChromaDB — wait briefly for an existing host announcement
-        await new Promise((r) => setTimeout(r, hostDiscovered ? 0 : 2500));
+        await meshProtocols!.publishRawTopic("pi-memory-host", announcement);
+      };
 
-        if (hostDiscovered) {
-          notify(pi, `Connecting to mesh ChromaDB host at ${resolvedHost}:${resolvedPort}`);
-        } else {
-          // No host found — we become the host
-          notify(pi, `No ChromaDB host found — becoming the host…`);
-          const started = await chromaLifecycle.ensureRunning();
-          if (started) {
+      // Start local ChromaDB readiness as a background promise.
+      // This runs in parallel with listening for remote host announcements
+      // so that a solo agent doesn't pay the 2.5 s wait penalty.
+      const localReady = (async (): Promise<boolean> => {
+        const running = await chromaLifecycle!.isRunning();
+        if (running) {
+          if (!hostResolved) {
+            hostResolved = true;
             resolvedHost = localIp ?? defaultHost;
             resolvedPort = defaultPort;
             isMemoryHost = true;
-            const announcement: import("./types.js").MemoryHostAnnouncement = {
-              type: "memory:host",
-              host: resolvedHost,
-              port: resolvedPort,
-              fromAgent: store.agentName,
-              fromPeerId: meshNode.peerId,
-              timestamp: Date.now(),
-            };
-            await meshProtocols.publishRawTopic("pi-memory-host", announcement);
-          } else {
-            console.warn("[pi-libp2p-mesh] Failed to start ChromaDB locally — memory tools disabled");
+            notify(pi, `ChromaDB already running locally — announcing as host at ${resolvedHost}:${resolvedPort}`);
+            await announceAsHost();
           }
+          return true;
         }
+        // Not running — spawn it. ensureRunning() checks the abort flag
+        // so we can cancel mid-start if a remote host appears.
+        const started = await chromaLifecycle!.ensureRunning();
+        if (started && !hostResolved) {
+          hostResolved = true;
+          resolvedHost = localIp ?? defaultHost;
+          resolvedPort = defaultPort;
+          isMemoryHost = true;
+          await announceAsHost();
+          return true;
+        }
+        return false;
+      })();
+
+      // Race local startup against a 2.5 s window for remote hosts.
+      // If local finishes first (the common solo-agent case), we skip the
+      // wait entirely. If a remote host announces, we abort local and
+      // connect to remote.
+      await Promise.race([
+        localReady,
+        new Promise<void>((r) => setTimeout(r, 2500)),
+      ]);
+
+      // If neither resolved yet (local still starting, no remote heard),
+      // wait for local to finish.
+      if (!hostResolved) {
+        const ok = await localReady;
+        if (!ok) {
+          console.warn("[pi-libp2p-mesh] Failed to start ChromaDB locally — memory tools disabled");
+        }
+      } else if (!isMemoryHost) {
+        // Remote host won — stop our local ChromaDB if we started it
+        chromaLifecycle.stop();
+        notify(pi, `Connecting to mesh ChromaDB host at ${resolvedHost}:${resolvedPort}`);
       }
 
       // ── Initialize AgentMemory ───────────────────────────────────────
@@ -653,6 +956,34 @@ export default async function (pi: ExtensionAPI) {
           notify(pi, `Background prune: removed ${removed} stale peer(s)`);
         }
       }, 30_000);
+
+      // ── Mission Control Server ─────────────────────────────────────
+      // Start the HTTP+WS server for the 3D network visualization.
+      // State is pushed every 2 s so the dashboard stays in sync.
+      try {
+        const mcPort = parseOptionalInt(pi.getFlag("mesh-mc-port")) ?? 9191;
+        missionControl = new MissionControlServer({ port: mcPort });
+        await missionControl.start();
+
+        // Initial state push
+        missionControl.updateState(buildMissionControlState());
+
+        // Periodic state refresh
+        missionControlInterval = setInterval(() => {
+          if (missionControl) {
+            missionControl.updateState(buildMissionControlState());
+          }
+        }, 2_000);
+
+        ctx.ui.notify(
+          `🛰 Mission control: http://localhost:${mcPort}`,
+          "info",
+        );
+      } catch (err: any) {
+        console.warn(
+          `[pi-libp2p-mesh] Mission control server failed to start: ${err.message}`,
+        );
+      }
 
       // Periodic ChromaDB host re-announcement — ensures late joiners
       // and nodes that missed the initial announcement can discover us.
@@ -696,6 +1027,15 @@ export default async function (pi: ExtensionAPI) {
     if (pruneInterval) {
       clearInterval(pruneInterval);
       pruneInterval = null;
+    }
+    // Stop mission control
+    if (missionControlInterval) {
+      clearInterval(missionControlInterval);
+      missionControlInterval = null;
+    }
+    if (missionControl) {
+      await missionControl.stop();
+      missionControl = null;
     }
     // Stop memory host re-announcement
     if (memoryHostAnnounceInterval) {
@@ -868,6 +1208,66 @@ export default async function (pi: ExtensionAPI) {
           : `🧹 Pruned ${removed} stale peer(s). ${before} → ${after} (${connected} connected)`,
         "info",
       );
+    },
+  });
+
+  pi.registerCommand("mesh-mission-control", {
+    description:
+      "Open the 3D mission-control network dashboard (starts server if not running)",
+    handler: async (_args, ctx) => {
+      if (!meshNode) {
+        ctx.ui.notify("Mesh node not running", "warning");
+        return;
+      }
+
+      if (!missionControl) {
+        // Start it on demand
+        try {
+          const mcPort = parseOptionalInt(pi.getFlag("mesh-mc-port")) ?? 9191;
+          missionControl = new MissionControlServer({ port: mcPort });
+          await missionControl.start();
+          missionControl.updateState(buildMissionControlState());
+
+          missionControlInterval = setInterval(() => {
+            if (missionControl) {
+              missionControl.updateState(buildMissionControlState());
+            }
+          }, 2_000);
+
+          ctx.ui.notify(
+            `🛰 Mission control started: http://localhost:${mcPort}`,
+            "info",
+          );
+        } catch (err: any) {
+          ctx.ui.notify(
+            `Failed to start mission control: ${err.message}`,
+            "error",
+          );
+          return;
+        }
+      } else {
+        const port = missionControl.port;
+        ctx.ui.notify(
+          `🛰 Mission control running at http://localhost:${port}`,
+          "info",
+        );
+      }
+
+      // Try to open the browser
+      try {
+        const { exec } = await import("node:child_process");
+        const url = `http://localhost:${missionControl!.port}`;
+        const platform = process.platform;
+        if (platform === "darwin") {
+          exec(`open "${url}"`);
+        } else if (platform === "win32") {
+          exec(`start "" "${url}"`);
+        } else {
+          exec(`xdg-open "${url}"`);
+        }
+      } catch {
+        // Non-fatal — user can open manually
+      }
     },
   });
 }
