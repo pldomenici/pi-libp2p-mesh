@@ -79,7 +79,11 @@ const mcStats = {
 interface PendingResolver {
   resolve: (text: string) => void;
   timer: ReturnType<typeof setTimeout>;
-  timedOut: boolean;
+  /** True once max heartbeats reached and timeout resolved. */
+  resolved: boolean;
+  peerId: string;
+  requestId: string;
+  messagePreview: string;
 }
 
 /**
@@ -510,7 +514,6 @@ export default async function (pi: ExtensionAPI) {
       // Uses a module-level FIFO resolver queue paired with the `agent_end`
       // event for reliable 1:1 request-response mapping.
 
-      const REQUEST_TIMEOUT_MS = 120_000;
       const MAX_QUEUE_SIZE = 50;
 
       /** Extract assistant text from an agent_end event's messages array. */
@@ -534,6 +537,22 @@ export default async function (pi: ExtensionAPI) {
         return "[no assistant response]";
       }
 
+      /** Deliver an async response (or heartbeat) to a requesting peer. */
+      async function deliverAsyncResponse(
+        targetPeerId: string,
+        responseToRequestId: string,
+        message: string,
+      ): Promise<void> {
+        if (!meshProtocols) return;
+        await meshProtocols.sendMessage(targetPeerId, {
+          protocol: "/pi-agent/0.1.0",
+          requestId: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+          fromAgent: store.agentName,
+          message,
+          responseToRequestId,
+        });
+      }
+
       // Use agent_end instead of turn_end for perfect request-response pairing.
       // Each sendUserMessage() call triggers exactly one agent cycle, and each
       // agent cycle produces exactly one agent_end event.
@@ -542,10 +561,18 @@ export default async function (pi: ExtensionAPI) {
         if (!pending) return; // No mesh request waiting — must be user chat
 
         clearTimeout(pending.timer);
-        if (pending.timedOut) return; // Already resolved by timeout
 
+        // Always deliver the real response, even if heartbeats were sent.
+        // Late is better than never — the sender gets the full answer.
         const responseText = extractResponseFromMessages((_event as any).messages);
-        pending.resolve(responseText);
+        if (pending.resolved) {
+          // Heartbeats already resolved with timeout — deliver late response
+          // as a follow-up mesh_send with the real answer.
+          deliverAsyncResponse(pending.peerId, pending.requestId, responseText)
+            .catch((err) => console.warn("[pi-libp2p-mesh] late response delivery failed:", (err as Error).message));
+        } else {
+          pending.resolve(responseText);
+        }
       });
 
       // Incoming LLM-forward requests (autoReply !== true) — enqueue into FIFO
@@ -634,17 +661,41 @@ export default async function (pi: ExtensionAPI) {
         }
 
         return new Promise<string>((resolve) => {
-          let timedOut = false;
-          const timer = setTimeout(() => {
-            timedOut = true;
-            resolve(
-              `[timeout] Agent did not respond within ${REQUEST_TIMEOUT_MS / 1000}s to: "${request.message}"`,
-            );
-          }, REQUEST_TIMEOUT_MS);
+          const HEARTBEAT_INTERVAL_MS = 30_000;
+          const MAX_HEARTBEATS = 4; // 4 × 30s = 120s total
+          let heartbeatCount = 0;
 
-          // Push resolver BEFORE calling sendUserMessage so the agent_end
-          // handler always finds it in the queue.
-          pendingResolvers.push({ resolve, timer, timedOut });
+          // Push resolver BEFORE creating the heartbeat timer so the
+          // pending object is available for sendHeartbeat to update.
+          const pending: PendingResolver = {
+            resolve,
+            timer: null as any, // set below
+            resolved: false,
+            peerId,
+            requestId: request.requestId,
+            messagePreview: request.message.slice(0, 100),
+          };
+          pendingResolvers.push(pending);
+
+          const sendHeartbeat = () => {
+            heartbeatCount++;
+            if (heartbeatCount >= MAX_HEARTBEATS) {
+              // Max heartbeats reached — resolve with timeout
+              pending.resolved = true;
+              resolve(
+                `[timeout] Agent did not respond within ${MAX_HEARTBEATS * HEARTBEAT_INTERVAL_MS / 1000}s to: "${request.message.slice(0, 100)}${request.message.length > 100 ? "…" : ""}"`,
+              );
+            } else {
+              // Send heartbeat to requester so they know we're still working
+              deliverAsyncResponse(peerId, request.requestId,
+                `[working… ${heartbeatCount * HEARTBEAT_INTERVAL_MS / 1000}s] Still processing: "${request.message.slice(0, 60)}${request.message.length > 60 ? "…" : ""}"`
+              ).catch(() => { /* best-effort */ });
+              // Re-arm timer for next heartbeat
+              pending.timer = setTimeout(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+            }
+          };
+
+          pending.timer = setTimeout(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 
           // Fire off the LLM request — agent_end will resolve our promise
           pi.sendUserMessage(userMessage, { deliverAs: "steer" });
@@ -1027,7 +1078,7 @@ export default async function (pi: ExtensionAPI) {
     // Drain and stale any pending request queue entries
     for (const pending of pendingResolvers) {
       clearTimeout(pending.timer);
-      if (!pending.timedOut) {
+      if (!pending.resolved) {
         pending.resolve("[shutdown] Session ended while request was queued");
       }
     }
